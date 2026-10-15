@@ -1,0 +1,49 @@
+{
+  "name": "@white-label/webmail",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
+  },
+  "scripts": {
+    "dev": "npm run build && npm run db:local && wrangler dev --config wrangler.local.jsonc --local --ip 127.0.0.1 --port 8788",
+    "dev:ui": "vite --host 127.0.0.1 --port 5174",
+    "build": "vite build",
+    "typecheck": "tsc -p tsconfig.ui.json && tsc -p tsconfig.worker.json",
+    "test": "vitest run",
+    "verify": "npm run typecheck && npm run test && npm run build",
+    "db:local": "wrangler d1 migrations apply company-mail-local --local --config wrangler.local.jsonc",
+    "doctor": "node scripts/doctor.mjs",
+    "configure": "node scripts/configure.mjs",
+    "archive:key": "node scripts/install-archive-key.mjs",
+    "bundle:check": "npm run verify && wrangler deploy --dry-run --config wrangler.jsonc --outdir .wrangler/deploy-check",
+    "deploy:check": "npm run verify && node scripts/doctor.mjs --strict && wrangler deploy --dry-run --config wrangler.production.jsonc --outdir .wrangler/deploy-check-production",
+    "deploy": "npm run verify && node scripts/doctor.mjs --strict && wrangler deploy --config wrangler.production.jsonc"
+  },
+  "dependencies": {
+    "@libsql/client": "0.18.0",
+    "htmlparser2": "^10.0.0",
+    "jose": "^6.1.3",
+    "lucide-react": "^1.23.0",
+    "postal-mime": "^2.6.1",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260717.1",
+    "@playwright/test": "^1.54.1",
+    "@types/node": "^24.0.15",
+    "@types/react": "^19.2.17",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.3",
+    "miniflare": "5.20261012.0-beta",
+    "typescript": "^5.9.3",
+    "vite": "^8.1.1",
+    "vitest": "5.0.5",
+    "wrangler": "4.151.0"
+  },
+  "overrides": {
+    "source-map-js": "1.2.2"
+  }
+}

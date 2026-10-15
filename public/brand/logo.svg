@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" aria-labelledby="title">
+  <title id="title">Webmail</title>
+  <rect x="3" y="5" width="42" height="38" rx="12" fill="#173B63"/>
+  <path d="M10 16.5 24 27l14-10.5" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="3"/>
+  <path d="M10 17v14.5c0 1.1.9 2 2 2h24c1.1 0 2-.9 2-2V17" fill="none" stroke="#fff" stroke-linecap="round" stroke-linejoin="round" stroke-width="3"/>
+  <circle cx="36.5" cy="11.5" r="3.5" fill="#62D6C5"/>
+</svg>

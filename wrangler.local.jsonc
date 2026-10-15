@@ -1,0 +1,36 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "company-webmail-local",
+  "main": "worker/index.ts",
+  "compatibility_date": "2026-07-17",
+  "workers_dev": false,
+  "preview_urls": false,
+  "assets": {
+    "binding": "ASSETS",
+    "directory": "./dist",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": [
+      "/api/*"
+    ]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "company-mail-local",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "vars": {
+    "APP_ENV": "local",
+    "COMPANY_CONFIG": "{\"brand\":{\"name\":\"Mi Empresa\",\"logo\":\"/brand/logo.svg\",\"primaryColor\":\"#2457c5\",\"locale\":\"es\"},\"appOrigin\":\"https://webmail.empresa.example\",\"mailbox\":{\"id\":\"contacto\",\"address\":\"contacto@empresa.example\",\"name\":\"Mi Empresa\"},\"archiveAddress\":\"archivo@example.net\",\"allowedUsers\":[\"owner@example.net\"],\"retentionDays\":180,\"cleanupEnabled\":true,\"storageBudgetBytes\":2000000000,\"storageProvider\":\"turso\",\"archiveCopies\":{\"enabled\":true,\"maxDecoratedBytes\":3145728},\"usageAlerts\":{\"enabled\":false,\"thresholdPercent\":95,\"zeroTrustSeatLimit\":50,\"delivery\":\"cloudflare\"},\"maxMessageBytes\":26214400,\"maxComposeBytes\":102400,\"dailyRecipientLimit\":200,\"monthlyRecipientLimit\":6000,\"provider\":\"mailjet\",\"identities\":[{\"email\":\"contacto@empresa.example\",\"name\":\"Mi Empresa\"},{\"email\":\"ventas@empresa.example\",\"name\":\"Mi Empresa\"},{\"email\":\"admin@empresa.example\",\"name\":\"Mi Empresa\"}]}",
+    "APP_ORIGIN": "http://127.0.0.1:8788",
+    "DEV_AUTH_EMAIL": "owner@example.net"
+  },
+  "r2_buckets": [
+    {
+      "binding": "MAIL",
+      "bucket_name": "company-mail-local"
+    }
+  ]
+}

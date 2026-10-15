@@ -1,0 +1,3 @@
+# Local development uses a simulated provider and the local R2 mock.
+# Replace this example identity with an address in config/companies/example.json.
+DEV_AUTH_EMAIL="owner@example.net"

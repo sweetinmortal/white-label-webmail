@@ -1,0 +1,9 @@
+{
+  "accountId": "00000000000000000000000000000000",
+  "workerName": "company-webmail",
+  "d1DatabaseName": "company-mail",
+  "d1DatabaseId": "00000000-0000-0000-0000-000000000000",
+  "tursoDatabaseUrl": "libsql://replace-with-company-database.turso.io",
+  "accessTeamDomain": "replace-with-team.cloudflareaccess.com",
+  "accessAudience": "REPLACE_WITH_ACCESS_AUDIENCE"
+}

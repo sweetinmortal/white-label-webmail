@@ -1,0 +1,51 @@
+{
+  "brand": {
+    "name": "Mi Empresa",
+    "logo": "/brand/logo.svg",
+    "primaryColor": "#2457c5",
+    "locale": "es"
+  },
+  "appOrigin": "https://webmail.empresa.example",
+  "mailbox": {
+    "id": "contacto",
+    "address": "contacto@empresa.example",
+    "name": "Mi Empresa"
+  },
+  "archiveAddress": "archivo@example.net",
+  "allowedUsers": [
+    "owner@example.net"
+  ],
+  "retentionDays": 180,
+  "cleanupEnabled": true,
+  "storageBudgetBytes": 2000000000,
+  "storageProvider": "turso",
+  "archiveCopies": {
+    "enabled": true,
+    "maxDecoratedBytes": 3145728
+  },
+  "usageAlerts": {
+    "enabled": false,
+    "thresholdPercent": 95,
+    "zeroTrustSeatLimit": 50,
+    "delivery": "cloudflare"
+  },
+  "maxMessageBytes": 26214400,
+  "maxComposeBytes": 102400,
+  "dailyRecipientLimit": 200,
+  "monthlyRecipientLimit": 6000,
+  "provider": "mailjet",
+  "identities": [
+    {
+      "email": "contacto@empresa.example",
+      "name": "Mi Empresa"
+    },
+    {
+      "email": "ventas@empresa.example",
+      "name": "Mi Empresa"
+    },
+    {
+      "email": "admin@empresa.example",
+      "name": "Mi Empresa"
+    }
+  ]
+}
