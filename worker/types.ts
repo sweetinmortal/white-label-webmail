@@ -11,6 +11,8 @@ export interface Env {
   ALLOWED_USERS?: string;
   ACCESS_TEAM_DOMAIN?: string;
   ACCESS_AUD?: string;
+  GOOGLE_CLIENT_ID?: string;
+  GOOGLE_CLIENT_SECRET?: string;
   TURSO_DATABASE_URL?: string;
   TURSO_AUTH_TOKEN?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
@@ -45,6 +47,8 @@ export interface MailConfig {
   archiveCopies?: { enabled: boolean; maxDecoratedBytes: number; incomingMode?: 'attachment' | 'forward-with-notice' };
   accessTeamDomain: string;
   accessAudience: string;
+  authProvider?: 'access' | 'google';
+  googleClientId?: string;
 }
 export interface Identity { email: string; mailboxIds: string[] }
 export interface IncomingEmail {

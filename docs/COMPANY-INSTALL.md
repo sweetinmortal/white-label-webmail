@@ -8,7 +8,8 @@ Revisa la marca de ejemplo en `public/brand/logo.svg`; reemplázala por el SVG a
 
 - `mailbox`: dirección principal y nombre de la bandeja;
 - `identities`: direcciones disponibles en el selector From y en el filtro;
-- `allowedUsers`: usuarios de Cloudflare Access autorizados para toda la instalación;
+- `allowedUsers`: direcciones autorizadas para toda la instalación; se comprueban también en el modo Google;
+- `auth`: opcional; omítelo para usar Cloudflare Access o configura `{"provider":"google"}` para inicio de sesión Google;
 - `archiveAddress`: buzón de archivo independiente;
 - `appOrigin`, retención, almacenamiento y límites.
 
@@ -16,15 +17,19 @@ La dirección principal puede aparecer en `identities`; el Worker la conserva un
 
 Todos los usuarios de `allowedUsers` pueden leer todos los mensajes y enviar desde cualquier identidad configurada. No uses una instalación para grupos que necesiten separación de datos.
 
-## 2. Preparar Cloudflare
+## 2. Elegir autenticación
 
-Aprovisiona un Worker separado, una base D1, almacenamiento temporal R2 o Turso y una aplicación Cloudflare Access. Restringe Access a los usuarios autorizados y configura por separado la recepción de cada dirección hacia el Worker.
+Cloudflare Access sigue siendo el modo predeterminado y conserva sus valores de manifiesto y validaciones. Para Google, sigue [Inicio de sesión con Google](GOOGLE-AUTH.md): configura un cliente OAuth web, añade `googleClientId` al manifiesto y deja fuera `accessTeamDomain` y `accessAudience`. En ambos modos `allowedUsers` restringe quién entra.
 
-Copia `deployment.example.json` a `deployment.local.json` y completa identificadores, nombres de recursos y valores de Access de la cuenta real. Para R2, completa `r2Bucket`; para Turso, `tursoDatabaseUrl`. El archivo local está excluido de Git: no pongas tokens en él.
+## 3. Preparar Cloudflare
+
+Aprovisiona un Worker separado, una base D1 y almacenamiento temporal R2 o Turso. Para el modo Access, crea una aplicación Cloudflare Access y restríngela a los usuarios autorizados. Configura por separado la recepción de cada dirección hacia el Worker.
+
+Copia `deployment.example.json` a `deployment.local.json` y completa los identificadores y nombres de recursos. En modo Access, incluye los valores Access requeridos; en modo Google, incluye `googleClientId` y omite `accessTeamDomain` y `accessAudience`. Para R2, completa `r2Bucket`; para Turso, `tursoDatabaseUrl`. El archivo local está excluido de Git: no pongas tokens en él.
 
 Genera manifiestos con `npm run configure -- --company config/companies/empresa.json`. Sin `deployment.local.json`, se generan solo el borrador y la configuración local. Con el manifiesto completo se genera también `wrangler.production.jsonc`; el comando no crea recursos, configura aliases ni despliega.
 
-## 3. Verificar Mailjet y preparar secretos
+## 4. Verificar Mailjet y preparar secretos
 
 Mailjet es el único adaptador de correo de producción implementado. Verifica el dominio remitente y cada dirección de `identities` en Mailjet; publica y valida los registros SPF y DKIM que indique el proveedor.
 
@@ -34,6 +39,7 @@ Configura el callback HTTPS `https://<dominio-del-webmail>/api/webhooks/mailjet`
 - `MAILJET_WEBHOOK_USER` y `MAILJET_WEBHOOK_PASSWORD`;
 - `TURSO_AUTH_TOKEN` si el almacén es Turso;
 - `CF_USAGE_API_TOKEN` si se habilitan alertas de uso.
+- `GOOGLE_CLIENT_SECRET` si `auth.provider` es `google`.
 
 El script de configuración genera el binding `ARCHIVE_EMAIL_COPY` cuando están activadas las copias. Comprueba que exista en la configuración de producción y que sus restricciones sigan limitadas a la dirección de archivo y al remitente permitido. Las alertas por Cloudflare Email Service pueden generar además `USAGE_ALERT_EMAIL` si se habilitan en la configuración.
 
@@ -41,7 +47,7 @@ Ejecuta `npm run archive:key` después de generar la configuración de producci�
 
 La configuración de `identities` no habilita aliases remotos, rutas de entrada ni remitentes de Mailjet. Completa y prueba esas operaciones en los servicios externos por cada dirección.
 
-## 4. Aplicar migraciones y desplegar
+## 5. Aplicar migraciones y desplegar
 
 Aplica las migraciones D1 en orden con la configuración de producción antes de desplegar; incluye `migrations/0003_mail_identities.sql`. Usa como nombre de base el configurado en `deployment.local.json`, por ejemplo:
 

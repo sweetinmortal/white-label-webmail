@@ -46,10 +46,16 @@ export interface ArchiveReplyContext {
 }
 export interface SendResult { id: string; status: SendStatus; reused: boolean }
 export interface Brand { name: string; logo: string; primaryColor: string; locale: string }
+export type AuthProvider = 'google' | 'access' | 'local';
+export interface AuthOptions {
+  provider: AuthProvider;
+  brand: Brand;
+}
 export interface SessionInfo {
   user: { email: string };
   brand: Brand;
   mailbox: { id: string; address: string; name: string };
+  authProvider?: AuthProvider;
   identities?: Address[];
   retentionDays: number;
   maxComposeBytes: number;

@@ -42,6 +42,10 @@ function isTursoDatabaseUrl(value) {
     && (url.pathname === '/' || url.pathname === '');
 }
 
+function isGoogleClientId(value) {
+  return typeof value === 'string' && /^\d+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(value);
+}
+
 function oneBinding(config, listName, bindingName) {
   const items = config?.[listName];
   return Array.isArray(items) && items.length === 1 && items[0]?.binding === bindingName ? items[0] : undefined;
@@ -59,6 +63,14 @@ if (draft?.vars?.COMPANY_CONFIG === undefined) {
   try { company = JSON.parse(draft.vars.COMPANY_CONFIG); }
   catch { errors.push('vars.COMPANY_CONFIG del borrador no contiene JSON válido.'); }
 }
+
+const authProvider = company?.auth?.provider ?? 'access';
+if (company?.auth !== undefined && (!company.auth || typeof company.auth !== 'object' || Array.isArray(company.auth)
+  || Object.keys(company.auth).some((key) => key !== 'provider')
+  || !['google', 'access'].includes(company.auth.provider))) {
+  errors.push('auth debe contener únicamente provider: google o access.');
+}
+if (!['google', 'access'].includes(authProvider)) errors.push('auth.provider debe ser google o access.');
 
 const storageProvider = company?.storageProvider ?? 'r2';
 const usageAlertDelivery = company?.usageAlerts?.delivery ?? 'mailjet';
@@ -126,14 +138,20 @@ if (local && hasOwn(local, 'send_email')) {
 }
 
 if (deployment) {
-  const required = ['accountId', 'd1DatabaseId', 'accessTeamDomain', 'accessAudience'];
+  const required = ['accountId', 'd1DatabaseId', ...(authProvider === 'google' ? ['googleClientId'] : ['accessTeamDomain', 'accessAudience'])];
   for (const key of required) {
     if (typeof deployment[key] !== 'string' || !deployment[key]) errors.push(`Falta ${key} en deployment.local.json.`);
   }
   if (deployment.accountId && !/^[a-f0-9]{32}$/.test(deployment.accountId)) errors.push('accountId de deployment.local.json no es válido.');
   if (deployment.d1DatabaseId && (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(deployment.d1DatabaseId)
     || deployment.d1DatabaseId === '00000000-0000-0000-0000-000000000000')) errors.push('d1DatabaseId de deployment.local.json no es válido.');
-  if (deployment.accessTeamDomain && !/^[a-z0-9-]+\.cloudflareaccess\.com$/.test(deployment.accessTeamDomain)) errors.push('accessTeamDomain de deployment.local.json no es válido.');
+  if (authProvider === 'google') {
+    if (hasOwn(deployment, 'accessTeamDomain') || hasOwn(deployment, 'accessAudience')) errors.push('La configuración Google no debe declarar accessTeamDomain ni accessAudience.');
+    if (deployment.googleClientId && !isGoogleClientId(deployment.googleClientId)) errors.push('googleClientId de deployment.local.json no es válido.');
+  } else {
+    if (hasOwn(deployment, 'googleClientId')) errors.push('La configuración Access no debe declarar googleClientId.');
+    if (deployment.accessTeamDomain && !/^[a-z0-9-]+\.cloudflareaccess\.com$/.test(deployment.accessTeamDomain)) errors.push('accessTeamDomain de deployment.local.json no es válido.');
+  }
   if (storageProvider === 'r2') {
     if (hasOwn(deployment, 'tursoDatabaseUrl')) errors.push('deployment.local.json para R2 no debe declarar tursoDatabaseUrl.');
     if (typeof deployment.r2Bucket !== 'string' || !/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(deployment.r2Bucket)) errors.push('Falta un r2Bucket válido en deployment.local.json.');
@@ -197,15 +215,23 @@ if (production) {
     const route = Array.isArray(routes) && routes.length === 1 ? routes[0] : undefined;
     if (!route || route.custom_domain !== true || route.pattern !== companyHost) errors.push('El custom domain de producción no coincide con COMPANY_CONFIG.appOrigin.');
   }
-  if (deployment?.accessTeamDomain && vars.ACCESS_TEAM_DOMAIN !== deployment.accessTeamDomain) errors.push('ACCESS_TEAM_DOMAIN no coincide con deployment.local.json.');
-  if (deployment?.accessAudience && vars.ACCESS_AUD !== deployment.accessAudience) errors.push('ACCESS_AUD no coincide con deployment.local.json.');
-  if (!vars.ACCESS_TEAM_DOMAIN || !vars.ACCESS_AUD) errors.push('Falta configurar Cloudflare Access.');
+  if (authProvider === 'google') {
+    if (!isGoogleClientId(vars.GOOGLE_CLIENT_ID)) errors.push('Producción debe declarar un GOOGLE_CLIENT_ID válido.');
+    if (deployment?.googleClientId && vars.GOOGLE_CLIENT_ID !== deployment.googleClientId) errors.push('GOOGLE_CLIENT_ID no coincide con deployment.local.json.');
+    if (hasOwn(vars, 'ACCESS_TEAM_DOMAIN') || hasOwn(vars, 'ACCESS_AUD')) errors.push('Producción Google no debe declarar variables de Cloudflare Access.');
+  } else {
+    if (deployment?.accessTeamDomain && vars.ACCESS_TEAM_DOMAIN !== deployment.accessTeamDomain) errors.push('ACCESS_TEAM_DOMAIN no coincide con deployment.local.json.');
+    if (deployment?.accessAudience && vars.ACCESS_AUD !== deployment.accessAudience) errors.push('ACCESS_AUD no coincide con deployment.local.json.');
+    if (!vars.ACCESS_TEAM_DOMAIN || !vars.ACCESS_AUD) errors.push('Falta configurar Cloudflare Access.');
+    if (hasOwn(vars, 'GOOGLE_CLIENT_ID')) errors.push('Producción Access no debe declarar GOOGLE_CLIENT_ID.');
+  }
   if (company?.usageAlerts?.enabled && vars.CLOUDFLARE_ACCOUNT_ID !== deployment?.accountId) errors.push('La cuenta para las alertas de uso no coincide con deployment.local.json.');
 }
 
 const emailProvider = company?.provider ?? 'mailjet';
 const requiredSecrets = [];
 if (emailProvider === 'mailjet') requiredSecrets.push('MAILJET_API_KEY', 'MAILJET_API_SECRET', 'MAILJET_WEBHOOK_USER', 'MAILJET_WEBHOOK_PASSWORD');
+if (authProvider === 'google') requiredSecrets.push('GOOGLE_CLIENT_SECRET');
 if (storageProvider === 'turso') requiredSecrets.push('TURSO_AUTH_TOKEN');
 if (company?.usageAlerts?.enabled) requiredSecrets.push('CF_USAGE_API_TOKEN');
 if (company?.archiveCopies?.enabled !== false) requiredSecrets.push('ARCHIVE_LINK_KEY');

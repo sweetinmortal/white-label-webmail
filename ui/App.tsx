@@ -1,7 +1,8 @@
 import { LoaderCircle, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import type { ArchiveReplyContext, Folder, MessageDetail, MessagePage, MessageSummary, SessionInfo } from '../shared/contracts';
+import type { ArchiveReplyContext, AuthOptions, Brand, Folder, MessageDetail, MessagePage, MessageSummary, SessionInfo } from '../shared/contracts';
 import ComposeDialog from './components/ComposeDialog';
+import LoginScreen from './components/LoginScreen';
 import MessageListPanel from './components/MessageListPanel';
 import ReaderPanel from './components/ReaderPanel';
 import Sidebar from './components/Sidebar';
@@ -9,7 +10,11 @@ import StartupScreen from './components/StartupScreen';
 import { apiFetch, ApiRequestError, getSession, MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, parseRawInWorker, requestRaw } from './lib/api';
 import { downloadBlob } from './lib/format';
 
-type StartupState = { status: 'loading' } | { status: 'ready'; session: SessionInfo } | { status: 'error'; error: ApiRequestError };
+type AuthQueryError = 'denied' | 'failed';
+type StartupState = { status: 'loading' }
+  | { status: 'ready'; session: SessionInfo }
+  | { status: 'login'; options: AuthOptions; authError?: AuthQueryError }
+  | { status: 'error'; error: ApiRequestError };
 type MobileView = 'list' | 'reader';
 type ComposeState = { replyTo?: MessageDetail; archiveReply?: ArchiveReplyContext };
 
@@ -31,17 +36,92 @@ function removeArchiveReplyParam(token: string) {
   window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
 }
 
+function takeAuthErrorParam(): AuthQueryError | undefined {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has('authError')) return undefined;
+  const value = url.searchParams.get('authError');
+  url.searchParams.delete('authError');
+  window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+  return value === 'denied' || value === 'failed' ? value : undefined;
+}
+
+function isAuthOptions(value: unknown): value is AuthOptions {
+  if (!value || typeof value !== 'object') return false;
+  const options = value as Partial<AuthOptions>;
+  const brand = options.brand as Partial<Brand> | undefined;
+  return (options.provider === 'google' || options.provider === 'access' || options.provider === 'local')
+    && !!brand
+    && typeof brand.name === 'string'
+    && typeof brand.logo === 'string'
+    && typeof brand.primaryColor === 'string'
+    && typeof brand.locale === 'string';
+}
+
+function asApiRequestError(error: unknown, fallback: string): ApiRequestError {
+  return error instanceof ApiRequestError ? error : new ApiRequestError(500, fallback);
+}
+
 export default function App() {
   const [startup, setStartup] = useState<StartupState>({ status: 'loading' });
+  const authQueryErrorRef = useRef<AuthQueryError | undefined>(undefined);
+  const authQueryErrorLoadedRef = useRef(false);
+  const unauthenticatedHandledRef = useRef(false);
+  const sessionLoadGenerationRef = useRef(0);
   const loadSession = useCallback(() => {
+    const generation = ++sessionLoadGenerationRef.current;
+    const isCurrent = () => generation === sessionLoadGenerationRef.current;
     setStartup({ status: 'loading' });
-    void getSession().then((session) => setStartup({ status: 'ready', session })).catch((error: unknown) => {
-      setStartup({ status: 'error', error: error instanceof ApiRequestError ? error : new ApiRequestError(500, 'No se pudo abrir el webmail.') });
-    });
+    void (async () => {
+      try {
+        const session = await getSession();
+        if (!isCurrent()) return;
+        setStartup({ status: 'ready', session });
+      } catch (sessionError) {
+        if (!isCurrent()) return;
+        const error = asApiRequestError(sessionError, 'No se pudo abrir el webmail.');
+        if (error.status === 401 || error.status === 403) {
+          try {
+            const optionsValue: unknown = await apiFetch('/auth/options');
+            if (!isCurrent()) return;
+            if (!isAuthOptions(optionsValue)) throw new ApiRequestError(500, 'No se pudo abrir el webmail.');
+            if (optionsValue.provider === 'google') {
+              setStartup({ status: 'login', options: optionsValue, authError: authQueryErrorRef.current });
+              authQueryErrorRef.current = undefined;
+              return;
+            }
+          } catch (optionsError) {
+            if (!isCurrent()) return;
+            setStartup({ status: 'error', error: asApiRequestError(optionsError, 'No se pudo cargar la configuración de acceso.') });
+            return;
+          }
+        }
+        if (!isCurrent()) return;
+        setStartup({ status: 'error', error });
+      }
+    })();
   }, []);
 
-  useEffect(() => { loadSession(); }, [loadSession]);
+  useEffect(() => {
+    if (!authQueryErrorLoadedRef.current) {
+      authQueryErrorRef.current = takeAuthErrorParam();
+      authQueryErrorLoadedRef.current = true;
+    }
+    loadSession();
+  }, [loadSession]);
+  useEffect(() => {
+    if (startup.status !== 'ready') return;
+    unauthenticatedHandledRef.current = false;
+    const handleUnauthenticated = () => {
+      if (unauthenticatedHandledRef.current) return;
+      unauthenticatedHandledRef.current = true;
+      loadSession();
+    };
+    window.addEventListener('webmail:unauthenticated', handleUnauthenticated);
+    return () => window.removeEventListener('webmail:unauthenticated', handleUnauthenticated);
+  }, [startup.status, loadSession]);
+
   if (startup.status === 'loading') return <main className="startup-screen"><LoaderCircle className="spin" aria-label="Cargando" /></main>;
+  if (startup.status === 'login') return <LoginScreen brand={startup.options.brand} authError={startup.authError} />;
   if (startup.status === 'error') return <StartupScreen error={startup.error} onRetry={loadSession} />;
   return <MailApp session={startup.session} />;
 }

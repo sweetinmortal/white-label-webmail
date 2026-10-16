@@ -1,5 +1,7 @@
-import { Bell, LoaderCircle, Mail, Plus, Send } from 'lucide-react';
+import { Bell, LoaderCircle, LogOut, Mail, Plus, Send } from 'lucide-react';
+import { useState } from 'react';
 import type { Folder, SessionInfo } from '../../shared/contracts';
+import { apiFetch } from '../lib/api';
 import { initials } from '../lib/format';
 
 export default function Sidebar({ session, folder, onFolder, onCompose, onTestUsageAlert, usageAlertTestBusy, usageAlertTestPending }: {
@@ -11,6 +13,21 @@ export default function Sidebar({ session, folder, onFolder, onCompose, onTestUs
   usageAlertTestBusy: boolean;
   usageAlertTestPending: boolean;
 }) {
+  const [logoutBusy, setLogoutBusy] = useState(false);
+  const [logoutError, setLogoutError] = useState(false);
+  const logout = async () => {
+    if (logoutBusy) return;
+    setLogoutBusy(true);
+    setLogoutError(false);
+    try {
+      await apiFetch<void>('/auth/logout', { method: 'POST' });
+      window.location.assign('/');
+    } catch {
+      setLogoutError(true);
+      setLogoutBusy(false);
+    }
+  };
+
   return (
     <aside className="sidebar" aria-label="Navegación principal">
       <div className="brand-lockup">
@@ -30,6 +47,13 @@ export default function Sidebar({ session, folder, onFolder, onCompose, onTestUs
           <span>{usageAlertTestPending ? 'Aviso pendiente' : usageAlertTestBusy ? 'Probando aviso…' : 'Probar aviso de cuota'}</span>
         </button>
         <span>Umbral: {session.usageAlerts.thresholdPercent}% de {session.usageAlerts.limit} usuarios</span>
+      </div>}
+      {session.authProvider === 'google' && <div className="logout-control">
+        <button className="button button-secondary logout-button" type="button" onClick={() => void logout()} disabled={logoutBusy} aria-label={logoutBusy ? 'Cerrando sesión' : 'Cerrar sesión'}>
+          {logoutBusy ? <LoaderCircle className="spin" size={17} aria-hidden="true" /> : <LogOut size={17} aria-hidden="true" />}
+          <span>{logoutBusy ? 'Cerrando sesión…' : 'Cerrar sesión'}</span>
+        </button>
+        {logoutError && <span className="logout-error" role="alert">No se pudo cerrar sesión. Inténtalo de nuevo.</span>}
       </div>}
       <div className="account-card"><div className="avatar avatar-account">{initials({ email: session.user.email })}</div><div><strong>{session.mailbox.name || session.brand.name}</strong><span>{session.user.email}</span></div></div>
     </aside>

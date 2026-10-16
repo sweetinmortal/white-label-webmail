@@ -64,6 +64,9 @@ export function loadConfig(env: Env): MailConfig {
     throw new AppError(503, 'CONFIG_INVALID', 'La configuración de la marca no es válida.');
   }
   if (!local && raw.provider !== undefined && raw.provider !== 'mailjet') throw new AppError(503, 'CONFIG_INVALID', 'El proveedor seleccionado no está disponible.');
+  if (raw.auth !== undefined && (!raw.auth || Array.isArray(raw.auth) || typeof raw.auth !== 'object' || !['access', 'google'].includes(raw.auth.provider))) {
+    throw new AppError(503, 'CONFIG_INVALID', 'El método de acceso no es válido.');
+  }
   if (raw.storageProvider !== undefined && !['r2', 'turso'].includes(raw.storageProvider)) throw new AppError(503, 'CONFIG_INVALID', 'El almacenamiento seleccionado no está disponible.');
   if (raw.usageAlerts !== undefined && (!raw.usageAlerts || Array.isArray(raw.usageAlerts) || typeof raw.usageAlerts.enabled !== 'boolean')) {
     throw new AppError(503, 'CONFIG_INVALID', 'Las alertas de uso no están configuradas correctamente.');
@@ -104,5 +107,7 @@ export function loadConfig(env: Env): MailConfig {
       ...(raw.usageAlerts.delivery === undefined ? {} : { delivery: raw.usageAlerts.delivery }),
     } } : {}),
     accessTeamDomain: env.ACCESS_TEAM_DOMAIN || '', accessAudience: env.ACCESS_AUD || '',
+    authProvider: raw.auth?.provider ?? 'access',
+    googleClientId: env.GOOGLE_CLIENT_ID || '',
   };
 }

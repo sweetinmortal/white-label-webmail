@@ -13,10 +13,12 @@ Incluye recibidos, lectura y descarga de adjuntos, redacción, respuestas, envia
 | D1 | Guardar el índice, estados de lectura, envíos y cuotas. |
 | Turso | Conservar temporalmente originales y contenido; R2 es un adaptador opcional. |
 | Mailjet API | Enviar desde las direcciones verificadas y confirmar estados mediante webhooks. |
-| Cloudflare Access + validación JWT | Restringir la aplicación a los usuarios configurados. |
+| Cloudflare Access o Google OpenID Connect | Restringir la aplicación a los usuarios configurados. |
 | React | Mostrar la bandeja y aplicar la marca de cada instalación. |
 
 La copia de archivo incluye un aviso y un botón para responder en el webmail. Los entrantes de hasta 3 MiB pueden conservar el original como `.eml` adjunto; para mensajes mayores se reenvía el original y se intenta enviar el aviso por separado. Los enlaces requieren autenticación y permiten preparar una respuesta aunque la copia temporal haya caducado.
+
+El acceso usa Cloudflare Access por defecto. Cada empresa puede elegir `auth.provider: "google"` para usar Google directamente, con sesiones revocables de seis horas en D1. Esta opción solicita únicamente `openid email` y requiere configurar un proyecto OAuth de Google. Consulta [Acceso con Google](docs/GOOGLE-AUTH.md).
 
 ## Cómo funciona
 

@@ -8,6 +8,13 @@ const companyFlag = args.indexOf('--company');
 if (companyFlag >= 0 && !args[companyFlag + 1]) throw new Error('Indica una ruta después de --company.');
 const companyPath = path.resolve(root, companyFlag >= 0 ? args[companyFlag + 1] : 'config/companies/example.json');
 const company = JSON.parse(await readFile(companyPath, 'utf8'));
+const authProvider = company.auth?.provider ?? 'access';
+if (company.auth !== undefined && (!company.auth || typeof company.auth !== 'object' || Array.isArray(company.auth)
+  || typeof company.auth.provider !== 'string' || Object.keys(company.auth).some((key) => key !== 'provider')
+  || !['google', 'access'].includes(authProvider))) {
+  throw new Error('auth debe contener únicamente provider: google o access.');
+}
+if (!['google', 'access'].includes(authProvider)) throw new Error('auth.provider debe ser google o access.');
 const storageProvider = company.storageProvider ?? 'r2';
 if (!['r2', 'turso'].includes(storageProvider)) throw new Error('storageProvider debe ser r2 o turso.');
 const usageAlertDelivery = company.usageAlerts?.delivery ?? 'mailjet';
@@ -71,14 +78,20 @@ catch (error) {
 // An incomplete manifest must never leave an older deployable config behind.
 await rm(productionPath, { force: true });
 if (!deployment || typeof deployment !== 'object' || Array.isArray(deployment)) throw new Error('deployment.local.json debe ser un objeto JSON.');
-const required = ['accountId', 'd1DatabaseId', 'accessTeamDomain', 'accessAudience'];
+const required = ['accountId', 'd1DatabaseId', ...(authProvider === 'google' ? ['googleClientId'] : ['accessTeamDomain', 'accessAudience'])];
 for (const key of required) {
   if (typeof deployment[key] !== 'string' || !deployment[key]) throw new Error(`Falta ${key} en deployment.local.json.`);
 }
 if (!/^[a-f0-9]{32}$/.test(deployment.accountId)) throw new Error('accountId de Cloudflare no válido.');
 if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(deployment.d1DatabaseId)
   || deployment.d1DatabaseId === '00000000-0000-0000-0000-000000000000') throw new Error('d1DatabaseId de Cloudflare no válido.');
-if (!/^[a-z0-9-]+\.cloudflareaccess\.com$/.test(deployment.accessTeamDomain)) throw new Error('accessTeamDomain no válido.');
+if (authProvider === 'google') {
+  if (Object.hasOwn(deployment, 'accessTeamDomain') || Object.hasOwn(deployment, 'accessAudience')) throw new Error('La configuración Google no debe incluir accessTeamDomain ni accessAudience.');
+  if (!/^\d+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(deployment.googleClientId)) throw new Error('googleClientId de Google no válido.');
+} else {
+  if (Object.hasOwn(deployment, 'googleClientId')) throw new Error('La configuración Access no debe declarar googleClientId.');
+  if (!/^[a-z0-9-]+\.cloudflareaccess\.com$/.test(deployment.accessTeamDomain)) throw new Error('accessTeamDomain no válido.');
+}
 
 if (storageProvider === 'r2') {
   if (Object.hasOwn(deployment, 'tursoDatabaseUrl')) throw new Error('deployment.local.json para R2 no debe declarar tursoDatabaseUrl.');
@@ -100,8 +113,12 @@ if (storageProvider === 'r2') {
   production.vars.TURSO_DATABASE_URL = deployment.tursoDatabaseUrl;
 }
 production.routes = [{ pattern: new URL(company.appOrigin).hostname, custom_domain: true }];
-production.vars.ACCESS_TEAM_DOMAIN = deployment.accessTeamDomain;
-production.vars.ACCESS_AUD = deployment.accessAudience;
+if (authProvider === 'google') {
+  production.vars.GOOGLE_CLIENT_ID = deployment.googleClientId;
+} else {
+  production.vars.ACCESS_TEAM_DOMAIN = deployment.accessTeamDomain;
+  production.vars.ACCESS_AUD = deployment.accessAudience;
+}
 if (company.usageAlerts?.enabled) production.vars.CLOUDFLARE_ACCOUNT_ID = deployment.accountId;
 if (company.usageAlerts?.enabled && usageAlertDelivery === 'cloudflare') {
   production.send_email = [{

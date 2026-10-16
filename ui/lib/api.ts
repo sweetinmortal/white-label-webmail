@@ -17,6 +17,12 @@ export class RawPreviewError extends Error {
   }
 }
 
+function announceUnauthenticated(status: number, code?: string) {
+  if ((status === 401 || (status === 403 && code === 'FORBIDDEN')) && typeof window !== 'undefined') {
+    window.dispatchEvent(new Event('webmail:unauthenticated'));
+  }
+}
+
 export type Attachment = { filename: string; mimeType: string; content: ArrayBuffer };
 export type ParsedRaw = { bodyText: string; attachments: Attachment[] };
 
@@ -41,6 +47,7 @@ export async function apiFetch<T>(path: string, init: RequestInit = {}, signal?:
       if (response.status === 401) message = 'Tu sesión segura ha expirado.';
       if (response.status === 503) message = 'El webmail todavía no tiene una configuración segura.';
     }
+    announceUnauthenticated(response.status, code);
     throw new ApiRequestError(response.status, message, code);
   }
   if (response.status === 204) return undefined as T;
@@ -53,7 +60,10 @@ export async function getSession(): Promise<SessionInfo> {
 
 export async function requestRaw(id: string, signal?: AbortSignal, maxBytes?: number): Promise<ArrayBuffer> {
   const response = await fetch(`/api/messages/${encodeURIComponent(id)}/raw`, { credentials: 'include', signal });
-  if (!response.ok) throw new ApiRequestError(response.status, 'No se pudo descargar el original.');
+  if (!response.ok) {
+    if (response.status === 401) announceUnauthenticated(response.status);
+    throw new ApiRequestError(response.status, 'No se pudo descargar el original.');
+  }
   const tooLarge = () => new RawPreviewError('Este mensaje supera el límite de vista previa. Descarga el original para abrirlo.', true);
   const declaredLengthHeader = response.headers.get('content-length');
   const declaredLength = declaredLengthHeader && /^\d+$/.test(declaredLengthHeader.trim())

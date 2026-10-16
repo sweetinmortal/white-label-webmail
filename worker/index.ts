@@ -8,6 +8,7 @@ import { cleanup, getCacheUsage, getMessage, getRaw, listMessages, processWebhoo
 import { seedLocal } from './dev';
 import { checkUsageAlerts, sendUsageAlertTest } from './services/usage-alerts';
 import { archiveReplyContext } from './services/archive-links';
+import { handleGoogleAuth, cleanupGoogleAuth } from './google-auth';
 
 async function handle(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -17,6 +18,8 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
   if (url.pathname === '/api/health' && request.method === 'GET') return json({ service: 'webmail', version: '0.1.0' });
   const config = loadConfig(env);
+  const authResponse = await handleGoogleAuth(request, env, config);
+  if (authResponse) return authResponse;
   if (url.pathname === '/api/webhooks/mailjet') {
     if (request.method !== 'POST') throw new AppError(405, 'METHOD_NOT_ALLOWED', 'Método no permitido.');
     await authenticateWebhook(request, env);
@@ -29,7 +32,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return json(await archiveReplyContext(env, config, url.searchParams.get('token') || ''));
   }
   if (url.pathname === '/api/session' && request.method === 'GET') {
-    return json({ user: { email: identity.email }, brand: config.brand, mailbox: config.mailbox, identities: mailIdentities(config), retentionDays: config.retentionDays, maxComposeBytes: config.maxComposeBytes, mode: config.mode, cache: await getCacheUsage(env, config), ...(config.usageAlerts ? { usageAlerts: { enabled: config.usageAlerts.enabled, thresholdPercent: config.usageAlerts.thresholdPercent, limit: config.usageAlerts.zeroTrustSeatLimit } } : {}) });
+    return json({ user: { email: identity.email }, authProvider: config.mode === 'local' ? 'local' : config.authProvider ?? 'access', brand: config.brand, mailbox: config.mailbox, identities: mailIdentities(config), retentionDays: config.retentionDays, maxComposeBytes: config.maxComposeBytes, mode: config.mode, cache: await getCacheUsage(env, config), ...(config.usageAlerts ? { usageAlerts: { enabled: config.usageAlerts.enabled, thresholdPercent: config.usageAlerts.thresholdPercent, limit: config.usageAlerts.zeroTrustSeatLimit } } : {}) });
   }
   if (url.pathname === '/api/usage-alerts/test' && request.method === 'POST') {
     return json(await sendUsageAlertTest(env, config));
@@ -80,6 +83,10 @@ export default {
   },
   async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
     const config = loadConfig(env);
+    if (config.authProvider === 'google') {
+      try { await cleanupGoogleAuth(env); }
+      catch { console.warn('webmail_auth_cleanup_failed'); }
+    }
     if (config.cleanupEnabled) {
       try { console.info('webmail_cleanup', await cleanup(env, config)); }
       catch { console.warn('webmail_cleanup_failed'); }

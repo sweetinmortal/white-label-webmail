@@ -38,6 +38,18 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .startup-card h1 { margin: 0; font-size: 24px; line-height: 1.2; color: var(--ink); }
 .startup-card p { margin: 0; color: var(--muted); line-height: 1.55; }
 .startup-detail { font-size: 13px; color: var(--muted); }
+.google-login-screen { padding: 24px; --blue-dark: color-mix(in srgb, var(--blue) 80%, #000); --blue-soft: color-mix(in srgb, var(--blue) 10%, #fff); }
+.google-login-card { width: min(440px, 100%); padding: clamp(26px, 6vw, 44px); border: 1px solid var(--line); border-radius: 16px; background: var(--white); box-shadow: var(--shadow); }
+.google-login-card .startup-logo { max-width: min(170px, 70%); max-height: 90px; object-fit: contain; }
+.google-login-icon { width: 46px; height: 46px; display: grid; place-items: center; border: 1px solid color-mix(in srgb, var(--blue) 25%, var(--line)); border-radius: 50%; color: var(--blue); background: var(--blue-soft); }
+.google-login-card h1 { font-size: clamp(22px, 6vw, 27px); overflow-wrap: anywhere; }
+.google-login-actions { width: 100%; display: grid; gap: 10px; margin-top: 4px; }
+.google-login-actions .google-login-button { width: 100%; min-height: 48px; gap: 12px; border: 1px solid #747775; border-radius: 8px; color: #1f1f1f; background: #fff; font-family: 'Google Sans', Roboto, Arial, sans-serif; font-size: 14px; font-weight: 500; letter-spacing: .01em; }
+.google-login-actions .google-login-button:hover:not(:disabled) { border-color: #5f6368; color: #1f1f1f; background: #f8f9fa; }
+.google-login-actions .google-login-button:focus-visible { outline: 2px solid #1a73e8; outline-offset: 2px; }
+.google-login-actions .google-login-button:disabled { color: #5f6368; background: #fff; cursor: wait; }
+.google-g-mark { width: 20px; height: 20px; flex: 0 0 20px; object-fit: contain; }
+.google-login-error { width: 100%; padding: 12px 14px; border-radius: 8px; color: var(--danger) !important; background: var(--danger-bg); font-size: 14px; }
 
 .app-shell { --blue-dark: color-mix(in srgb, var(--blue) 80%, #000); --blue-soft: color-mix(in srgb, var(--blue) 10%, #fff); height: 100svh; display: grid; grid-template-columns: 270px 430px minmax(0, 1fr); overflow: hidden; background: var(--white); }
 .app-shell :focus-visible { outline-color: color-mix(in srgb, var(--blue) 40%, transparent); }
@@ -68,6 +80,9 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .usage-alert-test > span { color: var(--muted); font-size: 11px; text-align: center; }
 .usage-alert-test .button:disabled { cursor: wait; opacity: .68; }
 .account-card { display: flex; align-items: center; gap: 12px; padding: 0 4px; }
+.logout-control { position: relative; display: grid; gap: 8px; margin: 0 8px 16px; }
+.logout-button { width: 100%; min-height: 42px; justify-content: flex-start; padding-inline: 13px; font-size: 14px; }
+.logout-error { color: var(--danger); font-size: 12px; line-height: 1.4; }
 .account-card strong { font-size: 14px; }
 .account-card span { margin-top: 4px; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
 .avatar { flex: 0 0 auto; width: 52px; height: 52px; display: grid; place-items: center; border-radius: 50%; color: #1f649f; background: #dceeff; font-size: 17px; font-weight: 600; }
@@ -206,6 +221,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
   .usage-alert-test { display: block; flex: 0 0 auto; width: 42px; margin: 0; }
   .usage-alert-test > span, .usage-alert-test .button span { display: none; }
   .usage-alert-test .button { width: 42px; min-height: 42px; padding: 0; font-size: 0; }
+  .logout-control { flex: 0 0 42px; width: 42px; margin: 0; }
+  .logout-button { width: 42px; min-height: 42px; justify-content: center; padding: 0; }
+  .logout-button span { display: none; }
+  .logout-error { position: absolute; z-index: 40; top: calc(100% + 8px); right: 0; width: min(260px, calc(100vw - 28px)); padding: 10px 12px; border: 1px solid #f4c8c2; border-radius: 7px; background: var(--danger-bg); box-shadow: var(--shadow); }
   .message-list-panel, .reader-panel { display: none; height: calc(100svh - 64px); min-height: 0; border-right: 0; }
   .app-shell[data-mobile-view='list'] .message-list-panel, .app-shell[data-mobile-view='reader'] .reader-panel { display: flex; }
   .mobile-list-nav { display: flex; align-items: center; gap: 4px; min-height: 51px; padding: 5px 12px; border-bottom: 1px solid var(--line-light); }
