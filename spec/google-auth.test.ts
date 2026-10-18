@@ -140,13 +140,31 @@ async function sessionCount(): Promise<number> {
 beforeAll(async () => {
   mf = new Miniflare(convertV4MiniflareOptions({
     modules: true,
-    script: 'export default { fetch() { return new Response("ok") } }',
+    compatibilityDate: '2026-07-17',
+    script: `export default {
+      async fetch(request) {
+        if (new URL(request.url).pathname !== '/__request-init-probe') return new Response('ok');
+        try {
+          const { url, init } = await request.json();
+          const constructed = new Request(url, init);
+          return Response.json({ accepted: true, method: constructed.method, redirect: constructed.redirect });
+        } catch (error) {
+          return Response.json({
+            accepted: false,
+            errorName: error instanceof Error ? error.name : 'Error',
+            errorMessage: error instanceof Error ? error.message : 'Unknown local request construction error',
+          });
+        }
+      }
+    }`,
     d1Databases: ['DB'],
   }));
   db = await mf.getD1Database('DB');
-  const migration = await readFile(new URL('../migrations/0004_auth.sql', import.meta.url), 'utf8');
-  const statements = migration.replace(/^\s*--.*$/gm, '').split(';').map(statement => statement.trim()).filter(Boolean);
-  for (const statement of statements) await db.prepare(statement).run();
+  for (const name of ['0004_auth.sql', '0005_auth_consumption.sql']) {
+    const migration = await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8');
+    const statements = migration.replace(/^\s*--.*$/gm, '').split(';').map(statement => statement.trim()).filter(Boolean);
+    for (const statement of statements) await db.prepare(statement).run();
+  }
   const keys = await generateKeyPair('RS256');
   privateKey = keys.privateKey;
   publicJwk = await exportJWK(keys.publicKey) as Record<string, unknown>;
@@ -214,6 +232,25 @@ describe('Google sign-in setup and CSRF boundaries', () => {
     for (let index = 0; index < 10; index++) await startRequest(env, config);
     await expect(startRequest(env, config)).rejects.toMatchObject({ status: 429, code: 'AUTH_RATE_LIMITED' });
   });
+
+  it('keeps consumed transactions in the start-rate window', async () => {
+    const { env, config } = fixture();
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      for (let index = 0; index < 10; index++) {
+        const flow = await beginFlow('/inbox');
+        const response = await callback(flow, '');
+        expect(response?.status).toBe(303);
+        expect(new URL(response!.headers.get('location')!).searchParams.get('authError')).toBe('failed');
+        const retained = await db.prepare('SELECT consumed_at FROM mail_auth_transactions WHERE state_hash = ?')
+          .bind(await sha256Hex(flow.state)).first<{ consumed_at: number | null }>();
+        expect(typeof retained?.consumed_at).toBe('number');
+      }
+      await expect(startRequest(env, config)).rejects.toMatchObject({ status: 429, code: 'AUTH_RATE_LIMITED' });
+    } finally {
+      warning.mockRestore();
+    }
+  });
 });
 
 describe('Google callback validation and session lifecycle', () => {
@@ -232,6 +269,9 @@ describe('Google callback validation and session lifecycle', () => {
     const success = await callback(flow);
     expect(success?.status).toBe(303);
     expect(success?.headers.get('location')).toBe(`${APP_ORIGIN}${flow.returnTo}`);
+    const consumedTransaction = await db.prepare('SELECT consumed_at FROM mail_auth_transactions WHERE state_hash = ?')
+      .bind(await sha256Hex(flow.state)).first<{ consumed_at: number | null }>();
+    expect(typeof consumedTransaction?.consumed_at).toBe('number');
     const sessionToken = cookieValue(success!, GOOGLE_SESSION_COOKIE);
     expect(sessionToken).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(success!.headers.get('set-cookie')).toContain('HttpOnly');
@@ -274,6 +314,9 @@ describe('Google callback validation and session lifecycle', () => {
     const replay = await callback(flow);
     expect(replay?.status).toBe(303);
     expect(new URL(replay!.headers.get('location')!).searchParams.get('authError')).toBe('failed');
+    const retainedTransaction = await db.prepare('SELECT consumed_at FROM mail_auth_transactions WHERE state_hash = ?')
+      .bind(await sha256Hex(flow.state)).first<{ consumed_at: number | null }>();
+    expect(retainedTransaction?.consumed_at).toBe(consumedTransaction?.consumed_at);
     expect(fetchMock.mock.calls.filter(([url]) => String(url) === TOKEN_ENDPOINT)).toHaveLength(1);
     expect(fetchMock.mock.calls.every(([url]) => [TOKEN_ENDPOINT, JWKS_ENDPOINT].includes(String(url)))).toBe(true);
     expect(await sessionCount()).toBe(1);
@@ -322,6 +365,77 @@ describe('Google callback validation and session lifecycle', () => {
     const response = await callback(flow);
     expect(new URL(response!.headers.get('location')!).searchParams.get('authError')).toBe('failed');
     expect(await sessionCount()).toBe(0);
+  });
+
+  it('logs only the fixed failure stage and status, never the authorization code or provider tokens', async () => {
+    const flow = await beginFlow('/inbox');
+    const code = 'synthetic-auth-code-must-not-be-logged';
+    const markers = [code, 'synthetic-access-token-must-not-be-logged', 'synthetic-id-token-must-not-be-logged', 'synthetic-provider-error-must-not-be-logged'];
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(JSON.stringify({
+      error: markers[3], access_token: markers[1], id_token: markers[2],
+    }), { status: 400, headers: { 'content-type': 'application/json' } })));
+
+    try {
+      const response = await callback(flow, code);
+      expect(response?.status).toBe(303);
+      expect(warning).toHaveBeenCalledExactlyOnceWith(JSON.stringify({
+        event: 'google_auth_failed', stage: 'token_exchange', httpStatus: 400,
+      }));
+      const emitted = warning.mock.calls.map(([message]) => String(message)).join('\n');
+      for (const marker of markers) expect(emitted).not.toContain(marker);
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
+  it('uses a workerd-valid token request and rejects its 302 response without following it', async () => {
+    const flow = await beginFlow('/inbox');
+    const requestProbes: Array<{ accepted: boolean; method?: string; redirect?: string; errorName?: string; errorMessage?: string }> = [];
+    const unsupportedInitResponse = await mf.dispatchFetch('http://miniflare.test/__request-init-probe', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ url: TOKEN_ENDPOINT, init: { method: 'POST', redirect: 'error' } }),
+    });
+    const unsupportedInit = await unsupportedInitResponse.json() as typeof requestProbes[number];
+    expect(unsupportedInit).toMatchObject({ accepted: false, errorName: 'TypeError' });
+    expect(unsupportedInit.errorMessage).toBeTruthy();
+
+    const warning = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const tokenFetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const probeResponse = await mf.dispatchFetch('http://miniflare.test/__request-init-probe', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          url: String(input),
+          init: { method: init?.method, redirect: init?.redirect, headers: init?.headers },
+        }),
+      });
+      const probe = await probeResponse.json() as typeof requestProbes[number];
+      requestProbes.push(probe);
+      if (!probe.accepted) throw new TypeError('Local workerd rejected the token request options');
+      return new Response('redirect response must not be followed', {
+        status: 302,
+        headers: { location: 'https://accounts.google.com/should-not-be-requested' },
+      });
+    });
+    vi.stubGlobal('fetch', tokenFetch);
+
+    try {
+      const response = await callback(flow);
+      expect(response?.status).toBe(303);
+      expect(new URL(response!.headers.get('location')!).searchParams.get('authError')).toBe('failed');
+      expect(requestProbes).toEqual([{ accepted: true, method: 'POST', redirect: 'manual' }]);
+      expect(tokenFetch).toHaveBeenCalledTimes(1);
+      expect(tokenFetch.mock.calls[0]?.[0]).toBe(TOKEN_ENDPOINT);
+      expect(tokenFetch.mock.calls[0]?.[1]?.redirect).toBe('manual');
+      expect(warning).toHaveBeenCalledExactlyOnceWith(JSON.stringify({
+        event: 'google_auth_failed', stage: 'token_exchange', httpStatus: 302,
+      }));
+      expect(await sessionCount()).toBe(0);
+    } finally {
+      warning.mockRestore();
+    }
   });
 
   it('only accepts allowlisted Gmail or a verified Workspace domain', async () => {

@@ -66,6 +66,13 @@ function redirect(config: MailConfig, destination: string, error?: 'denied' | 'f
   headers.append('Set-Cookie', cookie(GOOGLE_FLOW_COOKIE, '', 0));
   return new Response(null, { status: 303, headers });
 }
+type AuthFailureStage = 'browser_proof' | 'transaction' | 'authorization_code' | 'token_exchange' | 'id_token' | 'verify_token' | 'claims' | 'session';
+function failed(config: MailConfig, destination: string, stage: AuthFailureStage, httpStatus?: number): Response {
+  // Operational diagnostics contain only fixed stage names and an HTTP status.
+  // Never log requests, codes, cookies, provider bodies, tokens or user details.
+  console.warn(JSON.stringify({ event: 'google_auth_failed', stage, ...(httpStatus === undefined ? {} : { httpStatus }) }));
+  return redirect(config, destination, 'failed');
+}
 function method(request: Request, expected: string): void {
   if (request.method !== expected) throw new AppError(405, 'METHOD_NOT_ALLOWED', 'Método no permitido.');
 }
@@ -127,40 +134,51 @@ export async function handleGoogleAuth(request: Request, env: Env, config: MailC
   }
   method(request, 'GET');
   let destination = '/';
+  let stage: AuthFailureStage = 'transaction';
   try {
     const state = url.searchParams.get('state') || '';
     const browser = cookieValue(request, GOOGLE_FLOW_COOKIE);
-    if (!opaquePattern.test(state) || !browser || url.searchParams.getAll('state').length !== 1) return redirect(config, '/', 'failed');
-    const transaction = await env.DB.prepare(`DELETE FROM mail_auth_transactions
-      WHERE state_hash = ? AND browser_hash = ? AND expires_at > ? RETURNING verifier, nonce, return_to`)
-      .bind(await hash(state), await hash(browser), now()).first<{ verifier: string; nonce: string; return_to: string }>();
-    if (!transaction) return redirect(config, '/', 'failed');
+    if (!opaquePattern.test(state) || !browser || url.searchParams.getAll('state').length !== 1) return failed(config, '/', 'browser_proof');
+    const consumedAt = now();
+    const transaction = await env.DB.prepare(`UPDATE mail_auth_transactions SET consumed_at = ?
+      WHERE state_hash = ? AND browser_hash = ? AND expires_at > ? AND consumed_at IS NULL
+      RETURNING verifier, nonce, return_to`)
+      .bind(consumedAt, await hash(state), await hash(browser), consumedAt)
+      .first<{ verifier: string; nonce: string; return_to: string }>();
+    if (!transaction) return failed(config, '/', 'transaction');
     destination = returnPath(transaction.return_to, config);
     if (url.searchParams.has('error')) return redirect(config, destination, 'denied');
     const code = url.searchParams.get('code');
-    if (!code || code.length > 8192 || url.searchParams.getAll('code').length !== 1) return redirect(config, destination, 'failed');
+    if (!code || code.length > 8192 || url.searchParams.getAll('code').length !== 1) return failed(config, destination, 'authorization_code');
+    stage = 'token_exchange';
     const response = await fetch(TOKEN_ENDPOINT, {
-      method: 'POST', redirect: 'error', signal: AbortSignal.timeout(10000),
+      // workerd accepts manual/follow only. The !response.ok guard below rejects
+      // 3xx responses without forwarding credentials to another destination.
+      method: 'POST', redirect: 'manual', signal: AbortSignal.timeout(10000),
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       body: new URLSearchParams({ code, client_id: config.googleClientId!, client_secret: env.GOOGLE_CLIENT_SECRET!,
         redirect_uri: config.appOrigin + CALLBACK, grant_type: 'authorization_code', code_verifier: transaction.verifier }),
     });
-    if (!response.ok) return redirect(config, destination, 'failed');
+    if (!response.ok) return failed(config, destination, 'token_exchange', response.status);
+    stage = 'id_token';
     const body: unknown = await response.json();
     const idToken = body && typeof body === 'object' && 'id_token' in body ? body.id_token : undefined;
-    if (typeof idToken !== 'string' || idToken.length > 16384) return redirect(config, destination, 'failed');
+    if (typeof idToken !== 'string' || idToken.length > 16384) return failed(config, destination, 'id_token');
+    stage = 'verify_token';
     googleKeys ??= createRemoteJWKSet(new URL('https://www.googleapis.com/oauth2/v3/certs'), { timeoutDuration: 5000, cooldownDuration: 30000, cacheMaxAge: 3600000 });
     const { payload } = await jwtVerify(idToken, googleKeys, {
       issuer: ['https://accounts.google.com', 'accounts.google.com'], audience: config.googleClientId,
       algorithms: ['RS256'], requiredClaims: ['exp', 'iat', 'sub', 'email', 'email_verified', 'nonce'], maxTokenAge: 600, clockTolerance: 5,
     });
-    if (payload.nonce !== transaction.nonce || payload.email_verified !== true || typeof payload.sub !== 'string' || !payload.sub || payload.sub.length > 255) return redirect(config, destination, 'failed');
+    stage = 'claims';
+    if (payload.nonce !== transaction.nonce || payload.email_verified !== true || typeof payload.sub !== 'string' || !payload.sub || payload.sub.length > 255) return failed(config, destination, 'claims');
     const email = normalizeEmail(payload.email);
     const domain = email.slice(email.lastIndexOf('@') + 1);
     // Google is authoritative for Gmail and verified Workspace domains. An old
     // email_verified claim alone cannot prove ownership of an external mailbox.
     if (domain !== 'gmail.com' && (typeof payload.hd !== 'string' || payload.hd.toLowerCase() !== domain)) return redirect(config, destination, 'denied');
     if (!config.allowedUsers.includes(email)) return redirect(config, destination, 'denied');
+    stage = 'session';
     const token = opaque(); const created = now();
     const statements: D1PreparedStatement[] = [];
     const previous = cookieValue(request, GOOGLE_SESSION_COOKIE);
@@ -173,7 +191,7 @@ export async function handleGoogleAuth(request: Request, env: Env, config: MailC
     return success;
   } catch {
     // Never reflect provider errors, authorization codes or tokens to the UI/logs.
-    return redirect(config, destination, 'failed');
+    return failed(config, destination, stage);
   }
 }
 
