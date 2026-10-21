@@ -35,7 +35,11 @@ export function secured(response: Response): Response {
   headers.set('Referrer-Policy', 'no-referrer');
   headers.set('X-Frame-Options', 'DENY');
   headers.set('Permissions-Policy', 'camera=(), microphone=(), geolocation=()');
-  headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data:; font-src 'self'; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
+  // Sanitized email bodies load in a sandboxed srcdoc iframe whose meta CSP blocks
+  // remote images by default. The parent policy must permit https images so
+  // that the user's "Mostrar imágenes" action can work in browsers that
+  // inherit the parent policy into local-scheme frames.
+  headers.set('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' blob: data: https:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; object-src 'none'; frame-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'");
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 export function failure(error: unknown): Response {

@@ -7,7 +7,7 @@ import MessageListPanel from './components/MessageListPanel';
 import ReaderPanel from './components/ReaderPanel';
 import Sidebar from './components/Sidebar';
 import StartupScreen from './components/StartupScreen';
-import { apiFetch, ApiRequestError, getSession, MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, parseRawInWorker, requestRaw } from './lib/api';
+import { apiFetch, ApiRequestError, getSession, MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, parseRawInWorker, requestOutgoingAttachment, requestRaw, type Attachment } from './lib/api';
 import { downloadBlob } from './lib/format';
 
 type AuthQueryError = 'denied' | 'failed';
@@ -138,7 +138,10 @@ function MailApp({ session }: { session: SessionInfo }) {
   const [mobileView, setMobileView] = useState<MobileView>('list');
   const [detail, setDetail] = useState<MessageDetail | null>(null);
   const [bodyText, setBodyText] = useState<string | null>(null);
-  const [attachments, setAttachments] = useState<import('./lib/api').Attachment[]>([]);
+  const [bodyHtml, setBodyHtml] = useState('');
+  const [bodyStyles, setBodyStyles] = useState('');
+  const [remoteImages, setRemoteImages] = useState(0);
+  const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [readerLoading, setReaderLoading] = useState(false);
   const [readerError, setReaderError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -256,18 +259,22 @@ function MailApp({ session }: { session: SessionInfo }) {
   }, [folder, unreadOnly, reloadKey, loadFolder]);
 
   useEffect(() => {
-    if (!selectedId) { setDetail(null); setBodyText(null); setAttachments([]); return; }
+    if (!selectedId) { setDetail(null); setBodyText(null); setBodyHtml(''); setBodyStyles(''); setRemoteImages(0); setAttachments([]); return; }
     const controller = new AbortController();
-    setReaderLoading(true); setReaderError(null); setDetail(null); setBodyText(null); setAttachments([]);
+    setReaderLoading(true); setReaderError(null); setDetail(null); setBodyText(null); setBodyHtml(''); setBodyStyles(''); setRemoteImages(0); setAttachments([]);
     void apiFetch<MessageDetail>(`/messages/${encodeURIComponent(selectedId)}`, {}, controller.signal)
       .then(async (message) => {
         setDetail(message);
-        if (message.direction === 'outgoing') { setBodyText(message.bodyText || ''); return; }
+        if (message.direction === 'outgoing') {
+          setBodyText(message.bodyText || '');
+          setAttachments((message.attachments ?? []).map((attachment, index) => ({ ...attachment, content: new ArrayBuffer(0), index })));
+          return;
+        }
         if (!message.rawAvailable) throw new Error('El original ya no está disponible en esta ventana local.');
         if (message.sizeBytes > MAX_PREVIEW_BYTES) throw new Error('Este mensaje supera el límite de vista previa. Descarga el original para abrirlo.');
         const raw = await requestRaw(message.id, controller.signal, MAX_PREVIEW_BYTES);
         const parsed = await parseRawInWorker(raw, controller.signal);
-        setBodyText(parsed.bodyText); setAttachments(parsed.attachments);
+        setBodyText(parsed.bodyText); setBodyHtml(parsed.html); setBodyStyles(parsed.styles); setRemoteImages(parsed.remoteImages); setAttachments(parsed.attachments);
       })
       .catch((error: unknown) => { if (!controller.signal.aborted) setReaderError(error instanceof Error ? error.message : 'No se pudo leer el mensaje.'); })
       .finally(() => { if (!controller.signal.aborted) setReaderLoading(false); });
@@ -331,6 +338,19 @@ function MailApp({ session }: { session: SessionInfo }) {
     setNextCursor(null);
     setReloadKey((current) => current + 1);
   }, [identityFilter, session.mode]);
+  const downloadAttachment = useCallback(async (attachment: Attachment) => {
+    if (!detail) return;
+    try {
+      if (attachment.index !== undefined) {
+        const response = await requestOutgoingAttachment(detail.id, attachment.index);
+        downloadBlob(await response.blob(), attachment.filename);
+      } else {
+        downloadBlob(new Blob([attachment.content], { type: attachment.mimeType }), attachment.filename);
+      }
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo descargar el adjunto.');
+    }
+  }, [detail]);
   const openCompose = useCallback(() => { setNotice(null); setCompose({}); }, []);
   const openReply = useCallback(() => {
     if (!detail) return;
@@ -341,7 +361,7 @@ function MailApp({ session }: { session: SessionInfo }) {
   return <div className="app-shell" data-mobile-view={compose ? 'compose' : mobileView} style={{ '--blue': session.brand.primaryColor } as CSSProperties}>
     <Sidebar session={session} folder={folder} onFolder={openFolder} onCompose={openCompose} onTestUsageAlert={testUsageAlert} usageAlertTestBusy={usageAlertTestBusy} usageAlertTestPending={usageAlertTestPending} />
     <MessageListPanel session={session} folder={folder} unreadOnly={unreadOnly} identityFilter={identityFilter} items={items} selectedId={selectedId} loading={listLoading} error={listError} nextCursor={nextCursor} onUnreadOnly={setUnreadOnly} onIdentityFilter={setIdentityFilter} onRefresh={refresh} onSelect={selectMessage} onLoadMore={() => void loadFolder(false)} onSeed={session.mode === 'local' ? seedLocal : undefined} seedLoading={seedLoading} locale={session.brand.locale} />
-    <ReaderPanel session={session} detail={detail} bodyText={bodyText} attachments={attachments} loading={readerLoading} error={readerError} onBack={() => setMobileView('list')} onMarkRead={(read) => { if (selectedId) void markRead(selectedId, read); }} onDownload={downloadOriginal} onDownloadAttachment={(attachment) => downloadBlob(new Blob([attachment.content], { type: attachment.mimeType }), attachment.filename)} onReply={openReply} />
+    <ReaderPanel session={session} detail={detail} bodyText={bodyText} html={bodyHtml} styles={bodyStyles} remoteImages={remoteImages} attachments={attachments} loading={readerLoading} error={readerError} onBack={() => setMobileView('list')} onMarkRead={(read) => { if (selectedId) void markRead(selectedId, read); }} onDownload={downloadOriginal} onDownloadAttachment={(attachment) => void downloadAttachment(attachment)} onReply={openReply} />
     {notice && !compose && <div className="toast" role="status">{notice}<button type="button" aria-label="Cerrar aviso" onClick={() => setNotice(null)}><X size={16} /></button></div>}
     {compose && <ComposeDialog session={session} replyTo={compose.replyTo} archiveReply={compose.archiveReply} onClose={() => setCompose(null)} onSent={onSent} />}
   </div>;

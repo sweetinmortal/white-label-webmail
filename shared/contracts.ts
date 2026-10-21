@@ -17,8 +17,10 @@ export interface MessageSummary {
   archiveStatus: ArchiveStatus;
   sendStatus?: SendStatus;
 }
+export interface AttachmentInfo { filename: string; mimeType: string; sizeBytes: number }
 export interface MessageDetail extends MessageSummary {
   replyTo?: Address;
+  attachments?: AttachmentInfo[];
   rfcMessageId?: string;
   references: string[];
   expiresAt: string;
@@ -26,8 +28,10 @@ export interface MessageDetail extends MessageSummary {
   bodyText?: string;
 }
 export interface MessagePage { items: MessageSummary[]; nextCursor: string | null }
+export interface OutgoingAttachment { filename: string; mimeType: string; contentBase64: string }
 export interface SendInput {
   from?: string;
+  attachments?: OutgoingAttachment[];
   to: string[];
   cc?: string[];
   bcc?: string[];
@@ -55,10 +59,13 @@ export interface SessionInfo {
   user: { email: string };
   brand: Brand;
   mailbox: { id: string; address: string; name: string };
+  archiveAddress?: string;
   authProvider?: AuthProvider;
   identities?: Address[];
   retentionDays: number;
   maxComposeBytes: number;
+  maxAttachments: number;
+  maxAttachmentBytes: number;
   mode: 'local' | 'production';
   cache: { usedBytes: number; budgetBytes: number; paused: boolean };
   usageAlerts?: { enabled: boolean; thresholdPercent: number; limit: number };

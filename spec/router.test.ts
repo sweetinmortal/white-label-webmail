@@ -12,6 +12,7 @@ const mocks = vi.hoisted(() => ({
     cleanup: vi.fn(),
     getCacheUsage: vi.fn(),
     getMessage: vi.fn(),
+    getOutgoingAttachment: vi.fn(),
     getRaw: vi.fn(),
     listMessages: vi.fn(),
     processWebhook: vi.fn(),
@@ -101,6 +102,7 @@ beforeEach(() => {
   mocks.service.listMessages.mockResolvedValue({ items: [], nextCursor: null });
   mocks.service.getMessage.mockResolvedValue({ id: 'm1' });
   mocks.service.getRaw.mockReturnValue(new Response('raw message', { headers: { 'content-type': 'message/rfc822' } }));
+  mocks.service.getOutgoingAttachment.mockReturnValue(new Response('attachment', { headers: { 'content-type': 'image/png' } }));
   mocks.service.sendMessage.mockResolvedValue({ id: 'm1', status: 'accepted', reused: false });
   mocks.service.processWebhook.mockResolvedValue(undefined);
   mocks.service.receiveEmail.mockResolvedValue(undefined);
@@ -188,6 +190,17 @@ describe('API router ordering and boundary enforcement', () => {
     const response = await worker.fetch(jsonRequest('/api/dev/seed', 'POST', {}), env());
     expect(response.status).toBe(404);
     expect(mocks.dev.seedLocal).not.toHaveBeenCalled();
+  });
+
+  it('routes attachment downloads by index and rejects other methods', async () => {
+    const response = await worker.fetch(jsonRequest('/api/messages/m1/attachments/0'), env());
+    expect(response.status).toBe(200);
+    expect(await response.text()).toBe('attachment');
+    expect(mocks.service.getOutgoingAttachment).toHaveBeenCalledWith(expect.anything(), expect.anything(), identity, 'm1', 0);
+
+    const rejected = await worker.fetch(jsonRequest('/api/messages/m1/attachments/0', 'POST'), env());
+    expect(rejected.status).toBe(405);
+    expect(mocks.service.getOutgoingAttachment).toHaveBeenCalledOnce();
   });
 
   it('applies security headers to successful raw-message responses', async () => {

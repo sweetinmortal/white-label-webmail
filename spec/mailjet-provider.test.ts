@@ -9,6 +9,7 @@ const message: OutboundMessage = {
   to: [{ email: 'archive@example.com', kind: 'to' }],
   subject: 'Provider contract',
   text: 'A test message',
+  attachments: [],
   headers: {},
   customId: 'provider-test',
   archiveAddress: 'archive@example.com',
@@ -18,7 +19,7 @@ const archiveConfig: MailConfig = {
   brand: { name: 'Example Company', logo: '/logo.svg', primaryColor: '#0875d1', locale: 'es' },
   appOrigin: 'https://mail.example.com', mailbox: { id: 'primary', address: 'contact@example.com', name: 'Example Company' },
   archiveAddress: 'archive@example.com', allowedUsers: [], retentionDays: 90, cleanupEnabled: true,
-  storageBudgetBytes: 1000, maxMessageBytes: 10000, maxComposeBytes: 10000, dailyRecipientLimit: 50, monthlyRecipientLimit: 500,
+  storageBudgetBytes: 1000, maxMessageBytes: 10000, maxComposeBytes: 10000, maxAttachments: 5, maxAttachmentBytes: 5 * 1024 * 1024, dailyRecipientLimit: 50, monthlyRecipientLimit: 500,
   mode: 'production', provider: 'mailjet', archiveCopies: { enabled: true, maxDecoratedBytes: 3 * 1024 * 1024 },
   accessTeamDomain: 'example.com', accessAudience: 'test',
 };
@@ -93,8 +94,8 @@ describe('Mailjet transport contract', () => {
     expect(archive.To).toEqual([{ Email: 'archive@example.com' }]);
     expect(archive.Bcc).toEqual([]);
     expect(archive.TextPart.match(/Responder en el webmail:/g)).toHaveLength(1);
-    expect(archive.TextPart).toContain('Copia del correo enviado');
-    expect(archive.HTMLPart).toContain('Copia del correo enviado');
+    expect(archive.TextPart).toContain('Copia archivada por Example Company. Remitente original: contact@example.com.');
+    expect(archive.HTMLPart).toContain('Copia archivada por Example Company. Remitente original: contact@example.com.');
   });
 
   it('keeps a customer accepted when the archive message has a definite error', async () => {

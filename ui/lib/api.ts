@@ -23,8 +23,8 @@ function announceUnauthenticated(status: number, code?: string) {
   }
 }
 
-export type Attachment = { filename: string; mimeType: string; content: ArrayBuffer };
-export type ParsedRaw = { bodyText: string; attachments: Attachment[] };
+export type Attachment = { filename: string; mimeType: string; content: ArrayBuffer; contentId?: string; inline?: boolean; sizeBytes?: number; index?: number };
+export type ParsedRaw = { bodyText: string; html: string; styles: string; remoteImages: number; attachments: Attachment[] };
 
 export async function apiFetch<T>(path: string, init: RequestInit = {}, signal?: AbortSignal): Promise<T> {
   const headers = new Headers(init.headers);
@@ -106,6 +106,15 @@ export async function requestRaw(id: string, signal?: AbortSignal, maxBytes?: nu
   return raw.buffer;
 }
 
+export async function requestOutgoingAttachment(messageId: string, index: number, signal?: AbortSignal): Promise<Response> {
+  const response = await fetch(`/api/messages/${encodeURIComponent(messageId)}/attachments/${index}`, { credentials: 'include', signal });
+  if (!response.ok) {
+    if (response.status === 401) announceUnauthenticated(response.status);
+    throw new ApiRequestError(response.status, 'No se pudo descargar el adjunto.');
+  }
+  return response;
+}
+
 export async function parseRawInWorker(buffer: ArrayBuffer, signal: AbortSignal): Promise<ParsedRaw> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('../raw-parser.worker.ts', import.meta.url), { type: 'module' });
@@ -123,10 +132,16 @@ export async function parseRawInWorker(buffer: ArrayBuffer, signal: AbortSignal)
       cleanup();
       reject(new RawPreviewError('La vista previa tardó demasiado. Descarga el original para abrirlo.'));
     }, 5000);
-    worker.onmessage = (event: MessageEvent<{ bodyText?: string; attachments?: Attachment[]; error?: string }>) => {
+    worker.onmessage = (event: MessageEvent<Partial<ParsedRaw> & { error?: string }>) => {
       cleanup();
       if (event.data.error) reject(new RawPreviewError(event.data.error));
-      else resolve({ bodyText: event.data.bodyText || '', attachments: event.data.attachments || [] });
+      else resolve({
+        bodyText: event.data.bodyText || '',
+        html: event.data.html || '',
+        styles: event.data.styles || '',
+        remoteImages: event.data.remoteImages || 0,
+        attachments: event.data.attachments || [],
+      });
     };
     worker.onerror = () => {
       cleanup();

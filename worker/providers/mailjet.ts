@@ -19,6 +19,11 @@ export const mailjetProvider: OutboundProvider = {
     if (!env.MAILJET_API_KEY || !env.MAILJET_API_SECRET) {
       throw new AppError(503, 'provider_not_configured', 'El proveedor de correo no está configurado.');
     }
+    const attachments = message.attachments.map((attachment) => ({
+      ContentType: attachment.mimeType,
+      Filename: attachment.filename,
+      Base64Content: attachment.contentBase64,
+    }));
     const ordinary = (recipients: OutboundMessage['to']) => ({
         From: { Email: message.from.email, Name: message.from.name },
         To: recipients.filter((recipient) => recipient.kind === 'to').map(({ email }) => ({ Email: email })),
@@ -26,6 +31,7 @@ export const mailjetProvider: OutboundProvider = {
         Bcc: recipients.filter((recipient) => recipient.kind === 'bcc').map(({ email }) => ({ Email: email })),
         Subject: message.subject,
         TextPart: message.text,
+        ...(attachments.length ? { Attachments: attachments } : {}),
         Headers: message.headers,
         CustomID: message.customId,
         TrackOpens: 'disabled',

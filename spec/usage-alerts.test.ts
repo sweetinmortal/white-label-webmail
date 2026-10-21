@@ -23,7 +23,7 @@ function config(overrides: Record<string, unknown> = {}): MailConfig {
     cleanupEnabled: true,
     storageBudgetBytes: 1_000_000,
     maxMessageBytes: 25 * 1024 * 1024,
-    maxComposeBytes: 100_000,
+    maxComposeBytes: 100_000, maxAttachments: 5, maxAttachmentBytes: 5 * 1024 * 1024,
     dailyRecipientLimit: 100,
     monthlyRecipientLimit: 1000,
     mode: 'production',

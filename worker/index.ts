@@ -4,7 +4,7 @@ import { loadConfig, isLoopback, mailIdentities } from './config';
 import { authenticate, authenticateWebhook, checkMutationOrigin } from './auth';
 import { AppError } from './errors';
 import { failure, json, readJson, secured } from './http';
-import { cleanup, getCacheUsage, getMessage, getRaw, listMessages, processWebhook, receiveEmail, sendMessage, setRead } from './services/mail';
+import { cleanup, getCacheUsage, getMessage, getOutgoingAttachment, getRaw, listMessages, processWebhook, receiveEmail, sendMessage, setRead } from './services/mail';
 import { seedLocal } from './dev';
 import { checkUsageAlerts, sendUsageAlertTest } from './services/usage-alerts';
 import { archiveReplyContext } from './services/archive-links';
@@ -32,7 +32,7 @@ async function handle(request: Request, env: Env): Promise<Response> {
     return json(await archiveReplyContext(env, config, url.searchParams.get('token') || ''));
   }
   if (url.pathname === '/api/session' && request.method === 'GET') {
-    return json({ user: { email: identity.email }, authProvider: config.mode === 'local' ? 'local' : config.authProvider ?? 'access', brand: config.brand, mailbox: config.mailbox, identities: mailIdentities(config), retentionDays: config.retentionDays, maxComposeBytes: config.maxComposeBytes, mode: config.mode, cache: await getCacheUsage(env, config), ...(config.usageAlerts ? { usageAlerts: { enabled: config.usageAlerts.enabled, thresholdPercent: config.usageAlerts.thresholdPercent, limit: config.usageAlerts.zeroTrustSeatLimit } } : {}) });
+    return json({ user: { email: identity.email }, authProvider: config.mode === 'local' ? 'local' : config.authProvider ?? 'access', brand: config.brand, mailbox: config.mailbox, archiveAddress: config.archiveAddress, identities: mailIdentities(config), retentionDays: config.retentionDays, maxComposeBytes: config.maxComposeBytes, maxAttachments: config.maxAttachments, maxAttachmentBytes: config.maxAttachmentBytes, mode: config.mode, cache: await getCacheUsage(env, config), ...(config.usageAlerts ? { usageAlerts: { enabled: config.usageAlerts.enabled, thresholdPercent: config.usageAlerts.thresholdPercent, limit: config.usageAlerts.zeroTrustSeatLimit } } : {}) });
   }
   if (url.pathname === '/api/usage-alerts/test' && request.method === 'POST') {
     return json(await sendUsageAlertTest(env, config));
@@ -50,8 +50,13 @@ async function handle(request: Request, env: Env): Promise<Response> {
   if (url.pathname === '/api/send' && request.method === 'POST') {
     const key = request.headers.get('idempotency-key');
     if (!key || !/^[a-zA-Z0-9_-]{16,128}$/.test(key)) throw new AppError(400, 'IDEMPOTENCY_REQUIRED', 'Falta identificar este intento de envío.');
-    const input = await readJson(request, config.maxComposeBytes * 6 + 16384) as SendInput;
+    const input = await readJson(request, config.maxComposeBytes + Math.ceil(config.maxAttachmentBytes * 4 / 3) + 32768) as SendInput;
     return json(await sendMessage(env, config, identity, input, key));
+  }
+  const attachmentMatch = /^\/api\/messages\/([a-zA-Z0-9_-]{1,128})\/attachments\/(\d{1,2})$/.exec(url.pathname);
+  if (attachmentMatch) {
+    if (request.method !== 'GET') throw new AppError(405, 'METHOD_NOT_ALLOWED', 'Método no permitido.');
+    return getOutgoingAttachment(env, config, identity, attachmentMatch[1], Number(attachmentMatch[2]));
   }
   const match = /^\/api\/messages\/([a-zA-Z0-9_-]{1,128})(?:\/(raw|read))?$/.exec(url.pathname);
   if (match) {

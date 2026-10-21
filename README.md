@@ -2,7 +2,7 @@
 
 Aplicación de correo compartida para una empresa sobre Cloudflare Workers. Cada instalación configura una dirección principal, identidades de envío y una allowlist de usuarios.
 
-Incluye recibidos, lectura y descarga de adjuntos, redacción, respuestas, enviados y leído/no leído por usuario. No implementa servidores IMAP ni SMTP.
+Incluye recibidos, lectura HTML aislada, descarga y envío de adjuntos, redacción, respuestas, enviados y leído/no leído por usuario. No implementa servidores IMAP ni SMTP.
 
 ## Componentes
 

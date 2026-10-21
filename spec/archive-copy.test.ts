@@ -8,7 +8,7 @@ function config(overrides: Partial<MailConfig> = {}): MailConfig {
     appOrigin: 'https://mail.example.com:8443',
     mailbox: { id: 'primary', address: 'inbox@example.com', name: 'Equipo' },
     archiveAddress: 'archive@example.com', allowedUsers: [], retentionDays: 90, cleanupEnabled: true,
-    storageBudgetBytes: 1000, maxMessageBytes: 10000, maxComposeBytes: 10000,
+    storageBudgetBytes: 1000, maxMessageBytes: 10000, maxComposeBytes: 10000, maxAttachments: 5, maxAttachmentBytes: 5 * 1024 * 1024,
     dailyRecipientLimit: 50, monthlyRecipientLimit: 500, mode: 'production', provider: 'mailjet',
     archiveCopies: { enabled: true, maxDecoratedBytes: 3 * 1024 * 1024 }, accessTeamDomain: 'example.com', accessAudience: 'test',
     ...overrides,
@@ -24,8 +24,8 @@ describe('archive copy content', () => {
 
     expect(copy.text).toContain('https://mail.example.com:8443/?reply=v1.header.payload');
     expect(copy.html).toContain('href="https://mail.example.com:8443/?reply=v1.header.payload"');
-    expect(copy.text).toContain('Copia del correo recibido');
-    expect(copy.text).toContain('No respondas desde Gmail');
+    expect(copy.text).toContain('Copia archivada por Equipo. Remitente original: sender@example.net.');
+    expect(copy.text).not.toContain('Copia del correo recibido');
   });
 
   it('escapes hostile brand name, sender name, subject, recipients, and body in HTML', () => {
@@ -45,7 +45,7 @@ describe('archive copy content', () => {
     expect(copy.html).not.toContain('<script>alert(1)</script>');
     expect(copy.html).not.toContain('<img src=x');
     expect(copy.html).not.toContain('<svg onload=');
-    expect(copy.text).toContain('<script>subject()</script>');
+    expect(copy.html).toContain('&lt;script&gt;subject()&lt;/script&gt;');
   });
 
   it('marks an attached original in both alternatives', () => {
@@ -53,7 +53,7 @@ describe('archive copy content', () => {
       direction: 'incoming', token: 'opaque-token', subject: 'Archivo', sender: 'sender@example.net',
       recipients: ['inbox@example.com'], originalAttached: true,
     });
-    expect(copy.text).toContain('se conserva en original.eml');
-    expect(copy.html).toContain('se conserva en original.eml');
+    expect(copy.text).toContain('El original completo está adjunto como original.eml.');
+    expect(copy.html).toContain('El original completo está adjunto como original.eml.');
   });
 });

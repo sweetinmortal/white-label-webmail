@@ -38,6 +38,8 @@ export interface MailConfig {
   storageBudgetBytes: number;
   maxMessageBytes: number;
   maxComposeBytes: number;
+  maxAttachments: number;
+  maxAttachmentBytes: number;
   dailyRecipientLimit: number;
   monthlyRecipientLimit: number;
   mode: 'local' | 'production';

@@ -11,7 +11,7 @@ function config(overrides: Partial<MailConfig> = {}): MailConfig {
     mailbox: { id: 'primary', address: 'inbox@example.com', name: 'Equipo' },
     archiveAddress: 'archive@example.com',
     allowedUsers: [], retentionDays: 90, cleanupEnabled: true, storageBudgetBytes: 1000,
-    maxMessageBytes: 10000, maxComposeBytes: 10000, dailyRecipientLimit: 50, monthlyRecipientLimit: 500,
+    maxMessageBytes: 10000, maxComposeBytes: 10000, maxAttachments: 5, maxAttachmentBytes: 5 * 1024 * 1024, dailyRecipientLimit: 50, monthlyRecipientLimit: 500,
     mode: 'production', provider: 'mailjet', archiveCopies: { enabled: true, maxDecoratedBytes: 3 * 1024 * 1024 },
     accessTeamDomain: 'example.com', accessAudience: 'test', ...overrides,
   };

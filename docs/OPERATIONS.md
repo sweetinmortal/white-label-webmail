@@ -28,6 +28,8 @@ El binding `ARCHIVE_EMAIL_COPY` permite las copias de archivo previstas por la c
 
 Los límites diarios y mensuales de destinatarios se comparten entre usuarios e identidades; incluye las copias de archivo cuando correspondan. El presupuesto temporal y la retención también son compartidos. Revisa el uso y las condiciones actuales de Cloudflare, Mailjet, D1 y R2 o Turso. Los niveles gratuitos pueden cambiar y no equivalen a uso ilimitado.
 
+Los adjuntos añaden presión al límite de 15 MB por mensaje de Mailjet y al de Cloudflare Email Service. La configuración segura por defecto es 5 archivos y 5 MB binarios en total; el mismo contenido se incluye en la copia de archivo. No eleves estos valores sin recalcular base64, cabeceras y duplicado del archivo. La descarga de adjuntos salientes usa el snapshot autenticado del envío y no expone el payload completo.
+
 La purga de mensajes temporales sigue la retención configurada y las condiciones de archivo de la aplicación. Antes de cambiar el período, revisa las cuotas y políticas de conservación. Un cambio no recupera mensajes purgados ni amplía el archivo de Gmail.
 
 Gmail conserva copias independientes. No hay sincronización de leído/no leído, carpetas, enviados, borrados u otras acciones; el estado de un sistema no prueba el estado del otro.

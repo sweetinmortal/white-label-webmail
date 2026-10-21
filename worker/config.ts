@@ -91,6 +91,8 @@ export function loadConfig(env: Env): MailConfig {
     storageBudgetBytes: integer(raw.storageBudgetBytes, 2000000000, 1048576, 8000000000),
     maxMessageBytes: integer(raw.maxMessageBytes, 26214400, 1024, 26214400),
     maxComposeBytes: integer(raw.maxComposeBytes, 102400, 1024, 524288),
+    maxAttachments: integer(raw.maxAttachments, 5, 1, 10),
+    maxAttachmentBytes: integer(raw.maxAttachmentBytes, 5242880, 1024, 5242880),
     dailyRecipientLimit: integer(raw.dailyRecipientLimit, 200, 1, 200),
     monthlyRecipientLimit: integer(raw.monthlyRecipientLimit, 6000, 1, 6000),
     mode: local ? 'local' : 'production', provider: local ? 'local' : 'mailjet',

@@ -1,6 +1,8 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import { addressParser, decodeWords } from 'postal-mime';
-import type { Address, Folder, MessageDetail, MessagePage, MessageSummary, SendInput, SendResult, SendStatus, ArchiveStatus } from '../../shared/contracts';
+import type { Address, AttachmentInfo, Folder, MessageDetail, MessagePage, MessageSummary, OutgoingAttachment, SendInput, SendResult, SendStatus, ArchiveStatus } from '../../shared/contracts';
+import { base64ByteLength, isMimeType, normalizeBase64, sanitizeAttachmentFilename } from '../../shared/attachments';
+import { parseEmailContent } from '../../shared/email-content';
 import { AppError } from '../errors';
 import { mailIdentities } from '../config';
 import type { Env, Identity, IncomingEmail, MailConfig } from '../types';
@@ -83,6 +85,8 @@ function validateConfig(config: MailConfig): void {
   if (!Number.isSafeInteger(config.storageBudgetBytes) || config.storageBudgetBytes < 0 ||
       !Number.isSafeInteger(config.maxMessageBytes) || config.maxMessageBytes < 0 ||
       !Number.isSafeInteger(config.maxComposeBytes) || config.maxComposeBytes < 1 ||
+      !Number.isSafeInteger(config.maxAttachments) || config.maxAttachments < 1 ||
+      !Number.isSafeInteger(config.maxAttachmentBytes) || config.maxAttachmentBytes < 1 ||
       !Number.isSafeInteger(config.dailyRecipientLimit) || config.dailyRecipientLimit < 1 ||
       !Number.isSafeInteger(config.monthlyRecipientLimit) || config.monthlyRecipientLimit < 1) {
     throw new AppError(500, 'limits_misconfigured', 'Los límites del buzón no están configurados correctamente.');
@@ -214,12 +218,14 @@ function rowToSummary(row: MessageRow, config: MailConfig, isRead = row.is_read 
   };
 }
 
-async function outgoingBodyText(env: Env, config: MailConfig, row: MessageRow): Promise<string | undefined> {
+interface OutgoingSnapshot { bodyText?: string; attachments: AttachmentInfo[]; rawAttachments: OutgoingAttachment[] }
+
+async function outgoingSnapshot(env: Env, config: MailConfig, row: MessageRow): Promise<OutgoingSnapshot | undefined> {
   if (row.direction !== 'outgoing') return undefined;
   // Rows created before snapshots were introduced may still have their body
   // in D1. Keep that nullable column readable, but never duplicate new text.
   if (!row.payload_key) {
-    if (row.body_text != null) return row.body_text;
+    if (row.body_text != null) return { bodyText: row.body_text, attachments: [], rawAttachments: [] };
     throw new AppError(404, 'payload_not_available', 'El snapshot del envío ya no está disponible.');
   }
   let object: { body: unknown; text(): Promise<string> };
@@ -231,15 +237,30 @@ async function outgoingBodyText(env: Env, config: MailConfig, row: MessageRow): 
     }
     throw error;
   }
-  const payload = parseJson<{ text?: unknown } | null>(await object.text(), null);
+  const payload = parseJson<{ text?: unknown; attachments?: unknown } | null>(await object.text(), null);
   if (!payload || typeof payload.text !== 'string') throw new AppError(500, 'payload_invalid', 'El snapshot del envío no es válido.');
   if (new TextEncoder().encode(payload.text).byteLength > config.maxComposeBytes) {
     throw new AppError(500, 'payload_invalid', 'El snapshot del envío supera el límite permitido.');
   }
-  return payload.text;
+  const rawAttachments: OutgoingAttachment[] = [];
+  const attachments: AttachmentInfo[] = [];
+  if (Array.isArray(payload.attachments) && payload.attachments.length <= config.maxAttachments) {
+    for (const entry of payload.attachments) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const candidate = entry as Record<string, unknown>;
+      if (typeof candidate.filename !== 'string' || typeof candidate.mimeType !== 'string' || typeof candidate.contentBase64 !== 'string') continue;
+      const base64 = normalizeBase64(candidate.contentBase64);
+      if (!base64 || !isMimeType(candidate.mimeType)) continue;
+      const info = attachmentInfo({ filename: candidate.filename, mimeType: candidate.mimeType, contentBase64: base64 });
+      if (!info) continue;
+      rawAttachments.push({ filename: info.filename, mimeType: info.mimeType, contentBase64: base64 });
+      attachments.push(info);
+    }
+  }
+  return { bodyText: payload.text, attachments, rawAttachments };
 }
 
-function canonicalPayload(input: { from: string; to: string[]; cc: string[]; bcc: string[]; subject: string; text: string; replyToMessageId?: string; archiveReplyToken?: string }): string {
+function canonicalPayload(input: { from: string; to: string[]; cc: string[]; bcc: string[]; subject: string; text: string; attachments: OutgoingAttachment[]; replyToMessageId?: string; archiveReplyToken?: string }): string {
   return JSON.stringify({
     from: normalizeEmail(input.from),
     to: input.to.map(normalizeEmail).sort(),
@@ -247,6 +268,11 @@ function canonicalPayload(input: { from: string; to: string[]; cc: string[]; bcc
     bcc: input.bcc.map(normalizeEmail).sort(),
     subject: input.subject,
     text: input.text,
+    attachments: input.attachments.map((attachment) => ({
+      filename: sanitizeAttachmentFilename(attachment.filename),
+      mimeType: attachment.mimeType.toLowerCase(),
+      contentBase64: attachment.contentBase64,
+    })),
     replyToMessageId: input.replyToMessageId ?? null,
     ...(input.archiveReplyToken ? { archiveReplyToken: input.archiveReplyToken } : {}),
   });
@@ -287,6 +313,65 @@ function validateAddressList(values: string[] | undefined, field: string): strin
   if (output.some((value) => value.includes('\r') || value.includes('\n') || !EMAIL_RE.test(value))) throw new AppError(400, `${field}_invalid`, 'Una de las direcciones no es válida.');
   if (new Set(output).size !== output.length) throw new AppError(400, `${field}_duplicate`, 'No se permiten destinatarios repetidos.');
   return output;
+}
+
+interface NormalizedAttachment extends OutgoingAttachment { sizeBytes: number }
+
+function normalizeAttachments(value: unknown, config: MailConfig): NormalizedAttachment[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > config.maxAttachments) {
+    throw new AppError(400, 'attachment_limit', `Puedes adjuntar como máximo ${config.maxAttachments} archivos.`);
+  }
+  let total = 0;
+  const output: NormalizedAttachment[] = [];
+  for (const entry of value) {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
+      throw new AppError(400, 'attachment_invalid', 'Uno de los adjuntos no es válido.');
+    }
+    const candidate = entry as Record<string, unknown>;
+    if (typeof candidate.filename !== 'string' || !candidate.filename.trim() || typeof candidate.mimeType !== 'string' || typeof candidate.contentBase64 !== 'string') {
+      throw new AppError(400, 'attachment_invalid', 'Uno de los adjuntos no es válido.');
+    }
+    if (!isMimeType(candidate.mimeType)) throw new AppError(400, 'attachment_type', 'El tipo de uno de los adjuntos no es válido.');
+    const contentBase64 = normalizeBase64(candidate.contentBase64);
+    if (!contentBase64) throw new AppError(400, 'attachment_invalid', 'El contenido de uno de los adjuntos no es válido.');
+    const sizeBytes = base64ByteLength(contentBase64);
+    if (sizeBytes < 1) throw new AppError(400, 'attachment_empty', 'Uno de los adjuntos está vacío.');
+    total += sizeBytes;
+    if (total > config.maxAttachmentBytes) {
+      throw new AppError(413, 'attachment_too_large', `Los adjuntos superan el límite de ${Math.round(config.maxAttachmentBytes / 1024 / 1024)} MB.`);
+    }
+    output.push({
+      filename: sanitizeAttachmentFilename(candidate.filename),
+      mimeType: candidate.mimeType.toLowerCase(),
+      contentBase64,
+      sizeBytes,
+    });
+  }
+  return output;
+}
+
+function attachmentInfo(attachment: OutgoingAttachment): AttachmentInfo | null {
+  const base64 = normalizeBase64(attachment.contentBase64);
+  if (!base64 || !isMimeType(attachment.mimeType)) return null;
+  return {
+    filename: sanitizeAttachmentFilename(attachment.filename),
+    mimeType: attachment.mimeType,
+    sizeBytes: base64ByteLength(base64),
+  };
+}
+
+function decodeBase64(value: string): Uint8Array {
+  const binary = atob(value);
+  const bytes = new Uint8Array(binary.length);
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index);
+  return bytes;
+}
+
+function attachmentFilenameHeader(filename: string): string {
+  const fallback = filename.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+  const encoded = encodeURIComponent(filename).replace(/['()*]/g, (character) => `%${character.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `attachment; filename="${fallback}"; filename*=UTF-8''${encoded}`;
 }
 
 function recipientRows(to: string[], cc: string[], bcc: string[]): OutboundRecipient[] {
@@ -344,16 +429,44 @@ export async function listMessages(env: Env, config: MailConfig, identity: Ident
 
 export async function getMessage(env: Env, config: MailConfig, identity: Identity, messageId: string): Promise<MessageDetail> {
   const row = await getRow(env.DB, identity, config, messageId);
-  const bodyText = await outgoingBodyText(env, config, row);
+  const snapshot = await outgoingSnapshot(env, config, row);
   return {
     ...rowToSummary(row, config),
     ...(row.reply_to_json ? { replyTo: rowAddress(row.reply_to_json) } : {}),
+    ...(snapshot?.attachments.length ? { attachments: snapshot.attachments } : {}),
     ...(row.rfc_message_id ? { rfcMessageId: row.rfc_message_id } : {}),
     references: parseJson<string[]>(row.references_json, []),
     expiresAt: row.expires_at,
     rawAvailable: Boolean(row.raw_key || row.payload_key),
-    ...(bodyText !== undefined ? { bodyText } : {}),
+    ...(snapshot?.bodyText !== undefined ? { bodyText: snapshot.bodyText } : {}),
   };
+}
+
+export async function getOutgoingAttachment(env: Env, config: MailConfig, identity: Identity, messageId: string, indexValue: number): Promise<Response> {
+  const row = await getRow(env.DB, identity, config, messageId);
+  if (row.direction !== 'outgoing') throw new AppError(404, 'attachment_not_found', 'El adjunto no está disponible.');
+  if (!row.payload_key) throw new AppError(404, 'payload_not_available', 'El snapshot del envío ya no está disponible.');
+  const index = Number(indexValue);
+  if (!Number.isSafeInteger(index) || index < 0 || index > config.maxAttachments - 1) throw new AppError(404, 'attachment_not_found', 'El adjunto no está disponible.');
+  const object = await getObject(getMailStore(env, config), row.payload_key);
+  const payload = parseJson<{ attachments?: unknown } | null>(await object.text(), null);
+  if (!payload || !Array.isArray(payload.attachments)) throw new AppError(404, 'attachment_not_found', 'El adjunto no está disponible.');
+  const entry = payload.attachments[index];
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) throw new AppError(404, 'attachment_not_found', 'El adjunto no está disponible.');
+  const candidate = entry as Record<string, unknown>;
+  if (typeof candidate.filename !== 'string' || typeof candidate.mimeType !== 'string' || typeof candidate.contentBase64 !== 'string') {
+    throw new AppError(404, 'attachment_not_found', 'El adjunto no está disponible.');
+  }
+  const base64 = normalizeBase64(candidate.contentBase64);
+  if (!base64 || !isMimeType(candidate.mimeType)) throw new AppError(404, 'attachment_not_found', 'El adjunto no está disponible.');
+  const filename = sanitizeAttachmentFilename(candidate.filename);
+  const bytes = decodeBase64(base64);
+  return new Response(bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer, { headers: {
+    'Content-Type': candidate.mimeType,
+    'Content-Disposition': attachmentFilenameHeader(filename),
+    'Content-Length': String(bytes.byteLength),
+    'Cache-Control': 'no-store',
+  } });
 }
 
 export async function getRaw(env: Env, config: MailConfig, identity: Identity, messageId: string): Promise<Response> {
@@ -400,8 +513,13 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
   const recipients = recipientRows(to, cc, bcc);
   if (!recipients.length || recipients.length > 10) throw new AppError(400, 'recipient_limit', 'El mensaje debe tener entre 1 y 10 destinatarios.');
   if (to.some((email) => cc.includes(email) || bcc.includes(email)) || cc.some((email) => bcc.includes(email))) throw new AppError(400, 'recipient_duplicate', 'No se permiten destinatarios repetidos.');
+  const attachments = normalizeAttachments(input.attachments, config);
   const composeBytes = new TextEncoder().encode(JSON.stringify({ to, cc, bcc, subject: input.subject, text: input.text })).byteLength;
   if (composeBytes > config.maxComposeBytes) throw new AppError(413, 'compose_too_large', 'El mensaje supera el tamaño permitido.');
+  const attachmentPayloadBytes = attachments.reduce((total, attachment) => total + attachment.contentBase64.length, 0);
+  if (composeBytes + attachmentPayloadBytes + 8192 > config.maxComposeBytes + config.maxAttachmentBytes * 2) {
+    throw new AppError(413, 'compose_too_large', 'El mensaje con adjuntos supera el tamaño permitido.');
+  }
 
   let original: MessageRow | undefined;
   if (input.replyToMessageId) {
@@ -416,7 +534,7 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
     'In-Reply-To': archivedReply.inReplyTo,
     References: archiveReferences([...archivedReply.references, archivedReply.inReplyTo]).join(' '),
   } : {};
-  const canonical = canonicalPayload({ from: address.email, to, cc, bcc, subject: input.subject, text: input.text, replyToMessageId: input.replyToMessageId, archiveReplyToken: input.archiveReplyToken });
+  const canonical = canonicalPayload({ from: address.email, to, cc, bcc, subject: input.subject, text: input.text, attachments, replyToMessageId: input.replyToMessageId, archiveReplyToken: input.archiveReplyToken });
   const payloadHash = await sha256(canonical);
   const existing = await findIdempotency(env.DB, config.mailbox.id, idempotencyKey);
   if (existing) {
@@ -435,7 +553,8 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
   const at = nowIso();
   const expiresAt = addDaysIso(config.retentionDays);
   const payloadKey = `outgoing/${config.mailbox.id}/${at.slice(0, 10)}/${messageId}.json`;
-  const payload = { id: messageId, from: address, to, cc, bcc, subject: input.subject, text: input.text, headers, customId: messageId, createdAt: at, ...(archiveReplyToken ? { archiveReplyToken } : {}) };
+  const payloadAttachments = attachments.map(({ filename, mimeType, contentBase64 }) => ({ filename, mimeType, contentBase64 }));
+  const payload = { id: messageId, from: address, to, cc, bcc, subject: input.subject, text: input.text, attachments: payloadAttachments, headers, customId: messageId, createdAt: at, ...(archiveReplyToken ? { archiveReplyToken } : {}) };
   const payloadBytes = new TextEncoder().encode(JSON.stringify(payload)).byteLength;
   let storageReserved = false;
   try { storageReserved = await reserveStorage(env.DB, config.mailbox.id, payloadBytes, config.storageBudgetBytes); }
@@ -479,7 +598,7 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
     const raced = await findIdempotency(env.DB, config.mailbox.id, idempotencyKey);
     return { id: messageId, status: raced?.status ?? 'unknown', reused: true };
   }
-  const outbound: OutboundMessage = { id: messageId, from: address, to: recipients, subject: input.subject, text: input.text, headers: Object.fromEntries(Object.entries(headers).filter(([name]) => SAFE_HEADER_NAMES.has(name.toLowerCase()))), customId: messageId, archiveAddress: archive, archiveReplyToken };
+  const outbound: OutboundMessage = { id: messageId, from: address, to: recipients, subject: input.subject, text: input.text, attachments: payloadAttachments, headers: Object.fromEntries(Object.entries(headers).filter(([name]) => SAFE_HEADER_NAMES.has(name.toLowerCase()))), customId: messageId, archiveAddress: archive, archiveReplyToken };
   let result: ProviderResult;
   try {
     result = await providerFor(config).send(env, config, outbound);
@@ -511,10 +630,10 @@ export async function deliverIncomingArchive(env: Env, config: MailConfig, messa
   let token: string | undefined;
   const subject = parseHeader(message.headers, 'subject', 998) || '';
   const headerSender = parseAddress(parseHeader(message.headers, 'from', MAX_ADDRESS_HEADER) || message.from);
+  const senderLabel = headerSender.name || headerSender.email || config.mailbox.name;
   const replyAddress = parseAddress(parseHeader(message.headers, 'reply-to') || headerSender.email);
   const parentId = archiveMessageId(parseHeader(message.headers, 'message-id', 998));
   const references = archiveReferences(referencesFrom(parseHeader(message.headers, 'references', 8192)));
-  const headers = parentId ? { 'In-Reply-To': parentId, References: archiveReferences([...references, parentId]).join(' ') } : undefined;
   if (config.archiveCopies?.enabled) {
     try {
       token = await sealArchiveReply(env, config, {
@@ -530,11 +649,26 @@ export async function deliverIncomingArchive(env: Env, config: MailConfig, messa
     cacheRaw = storageRaw;
     try {
       const original = await readArchiveOriginal(archiveRaw, size, config.archiveCopies!.maxDecoratedBytes);
-      const copy = archiveCopyContent(config, { direction: 'incoming', token, subject, sender: headerSender.email, recipients: [message.to], originalAttached: true });
+      const parsed = await parseEmailContent(original.buffer.slice(original.byteOffset, original.byteOffset + original.byteLength) as ArrayBuffer);
+      const copyAttachments: EmailAttachment[] = [];
+      for (const attachment of parsed.attachments.slice(0, 30)) {
+        if (attachment.inline && attachment.contentId) {
+          copyAttachments.push({ filename: attachment.filename, type: attachment.mimeType, content: attachment.content, disposition: 'inline', contentId: attachment.contentId });
+        } else {
+          copyAttachments.push({ filename: attachment.filename, type: attachment.mimeType, content: attachment.content, disposition: 'attachment' });
+        }
+      }
+      copyAttachments.push({ filename: 'original.eml', type: 'message/rfc822', content: original, disposition: 'attachment' });
+      if (copyAttachments.length > 32) throw new Error('archive_attachment_limit');
+      const copy = archiveCopyContent(config, {
+        direction: 'incoming', token, subject, sender: headerSender.email, senderName: headerSender.name,
+        recipients: [message.to], text: parsed.bodyText, html: parsed.html, htmlStyles: parsed.styles, originalAttached: true,
+      });
       const accepted = await env.ARCHIVE_EMAIL_COPY.send({
-        from: { email: config.mailbox.address, name: config.mailbox.name }, to: config.archiveAddress,
-        subject: subject.slice(0, 255) || 'Correo recibido', text: copy.text, html: copy.html, headers,
-        attachments: [{ filename: 'original.eml', type: 'application/octet-stream', content: original, disposition: 'attachment' }],
+        from: { email: config.mailbox.address, name: senderLabel }, to: config.archiveAddress,
+        subject: subject.slice(0, 255) || 'Correo recibido', text: copy.text, html: copy.html,
+        ...(EMAIL_RE.test(replyAddress.email) && replyAddress.email.length <= 254 ? { replyTo: { email: replyAddress.email, name: replyAddress.name || senderLabel } } : {}),
+        attachments: copyAttachments,
       });
       if (!accepted.messageId) throw new Error('archive_acceptance_unknown');
       return { archived: true, cacheRaw };
@@ -547,9 +681,12 @@ export async function deliverIncomingArchive(env: Env, config: MailConfig, messa
   try { await message.forward(config.archiveAddress); archived = true; } catch { /* the cache may still retain the original */ }
   if (archived && token && env.ARCHIVE_EMAIL_COPY) {
     try {
-      const copy = archiveCopyContent(config, { direction: 'incoming', token, subject, sender: headerSender.email, recipients: [message.to] });
-      await env.ARCHIVE_EMAIL_COPY.send({ from: { email: config.mailbox.address, name: config.mailbox.name }, to: config.archiveAddress,
-        subject: subject.slice(0, 255) || 'Correo recibido', text: copy.text, html: copy.html, headers });
+      const copy = archiveCopyContent(config, {
+        direction: 'incoming', token, subject, sender: headerSender.email, senderName: headerSender.name,
+        recipients: [message.to], notice: true,
+      });
+      await env.ARCHIVE_EMAIL_COPY.send({ from: { email: config.mailbox.address, name: senderLabel }, to: config.archiveAddress,
+        subject: subject.slice(0, 255) || 'Correo recibido', text: copy.text, html: copy.html });
     } catch { console.warn('webmail_archive_notice_failed'); }
   }
   return { archived, cacheRaw };

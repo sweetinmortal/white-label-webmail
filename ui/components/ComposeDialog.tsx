@@ -1,8 +1,13 @@
-import { AlertCircle, ArrowLeft, ChevronDown, LoaderCircle, Send, X } from 'lucide-react';
-import { useEffect, useRef, useState, type FormEvent } from 'react';
-import type { Address, ArchiveReplyContext, MessageDetail, SendInput, SendResult, SessionInfo } from '../../shared/contracts';
-import { apiFetch } from '../lib/api';
+import { AlertCircle, ArrowLeft, ChevronDown, LoaderCircle, Paperclip, Send, Trash2, X } from 'lucide-react';
+import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+import type { Address, ArchiveReplyContext, MessageDetail, OutgoingAttachment, SendInput, SendResult, SessionInfo } from '../../shared/contracts';
+import { ApiRequestError, apiFetch } from '../lib/api';
 import { hasValidEmails, replySubject, splitEmails } from '../lib/format';
+
+const MAX_ATTACHMENTS_FALLBACK = 5;
+const MAX_ATTACHMENT_BYTES_FALLBACK = 5 * 1024 * 1024;
+
+type PendingAttachment = { id: string; file: File; mimeType: string; sizeBytes: number };
 
 function createAttemptKey(): string {
   if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID();
@@ -46,10 +51,28 @@ function replyRecipients(replyTo: MessageDetail | undefined, identities: Address
     : { to: originalCc.join(', '), cc: '' };
 }
 
+function toBase64(buffer: ArrayBuffer): string {
+  const bytes = new Uint8Array(buffer);
+  let binary = '';
+  const chunk = 0x8000;
+  for (let offset = 0; offset < bytes.length; offset += chunk) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + chunk));
+  }
+  return btoa(binary);
+}
+
+function formatSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
 export default function ComposeDialog({ session, replyTo, archiveReply, onClose, onSent }: { session: SessionInfo; replyTo?: MessageDetail; archiveReply?: ArchiveReplyContext; onClose: () => void; onSent: (from?: string) => void }) {
   const identities = configuredIdentities(session);
   const defaultFrom = defaultFromAddress(session, replyTo, archiveReply);
   const initialRecipients = replyRecipients(replyTo, identities);
+  const maxAttachments = session.maxAttachments ?? MAX_ATTACHMENTS_FALLBACK;
+  const maxAttachmentBytes = session.maxAttachmentBytes ?? MAX_ATTACHMENT_BYTES_FALLBACK;
   const [from, setFrom] = useState(defaultFrom);
   const [to, setTo] = useState(archiveReply ? archiveReply.to.join(', ') : initialRecipients.to);
   const [cc, setCc] = useState(archiveReply ? archiveReply.cc.join(', ') : initialRecipients.cc);
@@ -57,15 +80,18 @@ export default function ComposeDialog({ session, replyTo, archiveReply, onClose,
   const [subject, setSubject] = useState(archiveReply ? replySubject(archiveReply.subject) : replyTo ? replySubject(replyTo.subject) : '');
   const [text, setText] = useState(() => !archiveReply && replyTo?.bodyText ? `\n\n\n${replyTo.bodyText.split('\n').map((line) => `> ${line}`).join('\n')}` : '');
   const [showCopies, setShowCopies] = useState(Boolean(archiveReply?.cc.length || initialRecipients.cc));
+  const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<SendResult | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submittedInput, setSubmittedInput] = useState<SendInput | null>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const idempotencyKey = useRef<string | null>(null);
+  const submitting = useRef(false);
   if (!idempotencyKey.current) idempotencyKey.current = createAttemptKey();
-  const dirty = Boolean(to || cc || bcc || subject || text || from !== defaultFrom);
+  const dirty = Boolean(to || cc || bcc || subject || text || attachments.length || from !== defaultFrom);
 
   useEffect(() => {
     closeButtonRef.current?.focus();
@@ -88,25 +114,69 @@ export default function ComposeDialog({ session, replyTo, archiveReply, onClose,
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [busy, dirty, onClose]);
 
+  const addFiles = (event: ChangeEvent<HTMLInputElement>) => {
+    const selected = Array.from(event.target.files ?? []);
+    event.target.value = '';
+    if (!selected.length) return;
+    setError(null);
+    const available = maxAttachments - attachments.length;
+    if (selected.length > available) {
+      setError(`Puedes adjuntar como máximo ${maxAttachments} archivos.`);
+      return;
+    }
+    const currentTotal = attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0);
+    const incomingTotal = selected.reduce((total, file) => total + file.size, 0);
+    if (currentTotal + incomingTotal > maxAttachmentBytes) {
+      setError(`Los adjuntos superan el límite de ${formatSize(maxAttachmentBytes)} en total.`);
+      return;
+    }
+    if (selected.some((file) => file.size === 0)) {
+      setError('Uno de los archivos está vacío.');
+      return;
+    }
+    setAttachments((current) => [...current, ...selected.map((file) => ({ id: createAttemptKey(), file, mimeType: file.type || 'application/octet-stream', sizeBytes: file.size }))]);
+  };
+
+  const removeAttachment = (id: string) => {
+    setAttachments((current) => current.filter((attachment) => attachment.id !== id));
+  };
+
   const submit = async (event: FormEvent) => {
     event.preventDefault();
+    if (submitting.current) return;
     setError(null);
-    const input = submittedInput ?? (() => {
-      if (!splitEmails(to).length || !hasValidEmails(to) || !hasValidEmails(cc) || !hasValidEmails(bcc)) { setError('Revisa las direcciones de destinatarios.'); return null; }
-      if (!subject.trim()) { setError('Escribe un asunto.'); return null; }
-      if (new Blob([text]).size > session.maxComposeBytes) { setError(`El mensaje supera el límite de ${Math.round(session.maxComposeBytes / 1024)} KB.`); return null; }
-      return {
+    let input = submittedInput;
+    if (!input) {
+      if (!splitEmails(to).length || !hasValidEmails(to) || !hasValidEmails(cc) || !hasValidEmails(bcc)) { setError('Revisa las direcciones de destinatarios.'); return; }
+      if (!subject.trim()) { setError('Escribe un asunto.'); return; }
+      const compose = { to: splitEmails(to).map(normalizeEmail), cc: splitEmails(cc).map(normalizeEmail), bcc: splitEmails(bcc).map(normalizeEmail), subject: subject.trim(), text };
+      if (compose.subject.length > 255 || /[\r\n]/.test(compose.subject)) { setError('El asunto debe tener como máximo 255 caracteres y una sola línea.'); return; }
+      const archiveAddress = normalizeEmail(session.archiveAddress || session.user.email);
+      const counted = { ...compose, bcc: [...compose.bcc] };
+      if (![...counted.to, ...counted.cc, ...counted.bcc].includes(archiveAddress)) counted.bcc.push(archiveAddress);
+      if (new Blob([JSON.stringify(counted)]).size > session.maxComposeBytes) { setError(`El mensaje supera el límite de ${Math.round(session.maxComposeBytes / 1024)} KB.`); return; }
+      submitting.current = true;
+      setBusy(true);
+      const outgoing: OutgoingAttachment[] = [];
+      try {
+        for (const attachment of attachments) {
+          outgoing.push({ filename: attachment.file.name, mimeType: attachment.mimeType, contentBase64: toBase64(await attachment.file.arrayBuffer()) });
+        }
+      } catch {
+        submitting.current = false;
+        setBusy(false);
+        setError('No se pudieron leer los adjuntos seleccionados.');
+        return;
+      }
+      input = {
         from,
-        to: splitEmails(to),
-        cc: splitEmails(cc),
-        bcc: splitEmails(bcc),
-        subject: subject.trim(),
-        text,
+        ...compose,
+        ...(outgoing.length ? { attachments: outgoing } : {}),
         ...(archiveReply ? { archiveReplyToken: archiveReply.token } : replyTo ? { replyToMessageId: replyTo.id } : {}),
       } satisfies SendInput;
-    })();
-    if (!input) return;
-    if (!submittedInput) setSubmittedInput(input);
+      setSubmittedInput(input);
+    }
+    submitting.current = true;
     setBusy(true);
     try {
       const sendResult = await apiFetch<SendResult>('/send', { method: 'POST', headers: { 'Idempotency-Key': idempotencyKey.current! }, body: JSON.stringify(input) });
@@ -115,14 +185,23 @@ export default function ComposeDialog({ session, replyTo, archiveReply, onClose,
       else setBusy(false);
     } catch (requestError) {
       setBusy(false);
+      // These errors are returned before the server records or sends an attempt.
+      // An ambiguous network failure keeps the original input and attempt key.
+      if (!submittedInput && requestError instanceof ApiRequestError && [400, 413, 415].includes(requestError.status)) {
+        setSubmittedInput(null);
+        idempotencyKey.current = createAttemptKey();
+      }
       setError(requestError instanceof Error ? requestError.message : 'No se pudo enviar.');
+    } finally {
+      submitting.current = false;
     }
   };
 
   const close = () => { if (!busy && (!dirty || window.confirm('¿Descartar este borrador?'))) onClose(); };
-  const fieldsLocked = submittedInput !== null;
+  const fieldsLocked = busy || submittedInput !== null;
   const canCheckStatus = !result || ['unknown', 'pending', 'sending'].includes(result.status);
   const actionLabel = submittedInput ? 'Consultar estado' : 'Enviar mensaje';
+  const attachmentTotal = attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0);
   return <div className="compose-backdrop" role="presentation"><div className="compose-dialog" role="dialog" aria-modal="true" aria-labelledby="compose-title" ref={dialogRef}>
     <header className="compose-header"><button type="button" className="icon-button" aria-label="Cerrar redacción" onClick={close} ref={closeButtonRef}><ArrowLeft size={27} /></button><h1 id="compose-title">Nuevo mensaje</h1><button type="button" className="icon-button" aria-label="Descartar redacción" onClick={close}><X size={28} /></button></header>
     <form className="compose-form" onSubmit={submit}>
@@ -131,6 +210,11 @@ export default function ComposeDialog({ session, replyTo, archiveReply, onClose,
       {showCopies && <><div className="compose-field"><label htmlFor="compose-cc">Cc</label><input id="compose-cc" value={cc} onChange={(event) => setCc(event.target.value)} placeholder="Opcional" disabled={fieldsLocked} /></div><div className="compose-field"><label htmlFor="compose-bcc">Cco</label><input id="compose-bcc" value={bcc} onChange={(event) => setBcc(event.target.value)} placeholder="Opcional" disabled={fieldsLocked} /></div></>}
       <div className="compose-field"><label htmlFor="compose-subject">Asunto</label><input id="compose-subject" value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="Asunto" disabled={fieldsLocked} /></div>
       <label className="sr-only" htmlFor="compose-body">Mensaje</label><textarea id="compose-body" className="compose-body" value={text} onChange={(event) => setText(event.target.value)} placeholder="Escribe tu mensaje" disabled={fieldsLocked} />
+      <div className="compose-attachments">
+        <input ref={fileInputRef} id="compose-files" type="file" multiple hidden onChange={addFiles} disabled={fieldsLocked} />
+        <div className="compose-attachments-head"><button type="button" className="button button-secondary" onClick={() => fileInputRef.current?.click()} disabled={fieldsLocked || attachments.length >= maxAttachments}><Paperclip size={17} />Adjuntar archivos</button><span>{attachments.length}/{maxAttachments} · {formatSize(attachmentTotal)} de {formatSize(maxAttachmentBytes)}</span></div>
+        {attachments.length > 0 && <ul className="compose-file-list">{attachments.map((attachment) => <li key={attachment.id}><Paperclip size={15} /><span>{attachment.file.name}</span><small>{formatSize(attachment.sizeBytes)}</small><button type="button" className="icon-button" aria-label={`Quitar ${attachment.file.name}`} onClick={() => removeAttachment(attachment.id)} disabled={fieldsLocked}><Trash2 size={16} /></button></li>)}</ul>}
+      </div>
       <div className="compose-footer"><p>Se guardará una copia en tu correo principal.</p>{session.mode === 'local' && <span className="local-copy">Vista local · Los envíos son de prueba</span>}<div className="compose-actions"><button type="button" className="button button-secondary" onClick={close} disabled={busy}>Descartar</button><button type="submit" className="button button-primary" disabled={busy || !canCheckStatus}>{busy ? <><LoaderCircle className="spin" size={19} /> Enviando…</> : submittedInput ? actionLabel : <><Send size={19} />{actionLabel}</>}</button></div></div>
       {error && <div className="form-error" role="alert"><AlertCircle size={18} />{error}</div>}
       {result && result.status === 'unknown' && <div className="send-unknown" role="status"><AlertCircle size={18} /><span>No podemos confirmar si el proveedor aceptó este intento. No se repetirá automáticamente. Revisa Enviados antes de crear un mensaje nuevo; puedes consultar el estado aquí.</span></div>}

@@ -70,7 +70,7 @@ describe('raw MIME worker privacy and attachment handling', () => {
     expect(result.bodyText).toBe('Visible & text');
     expect(result.bodyText).not.toContain('TRACKING_');
     expect(result.attachments).toHaveLength(1);
-    expect(result.attachments?.[0].filename).toBe('..evil-secret.bin');
+    expect(result.attachments?.[0].filename).toBe('evil-secret.bin');
     expect(result.attachments?.[0].filename).not.toMatch(/[\\/]/);
     expect(Array.from(new Uint8Array(result.attachments?.[0].content ?? new ArrayBuffer(0))))
       .toEqual([0, 1, 2, 255]);

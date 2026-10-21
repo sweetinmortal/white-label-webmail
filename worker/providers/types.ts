@@ -12,6 +12,7 @@ export interface OutboundMessage {
   to: OutboundRecipient[];
   subject: string;
   text: string;
+  attachments: Array<{ filename: string; mimeType: string; contentBase64: string }>;
   headers: Record<string, string>;
   customId: string;
   archiveAddress: string;

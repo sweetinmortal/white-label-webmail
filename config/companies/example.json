@@ -31,6 +31,8 @@
   },
   "maxMessageBytes": 26214400,
   "maxComposeBytes": 102400,
+  "maxAttachments": 5,
+  "maxAttachmentBytes": 5242880,
   "dailyRecipientLimit": 200,
   "monthlyRecipientLimit": 6000,
   "provider": "mailjet",

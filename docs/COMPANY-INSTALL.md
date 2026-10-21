@@ -11,7 +11,8 @@ Revisa la marca de ejemplo en `public/brand/logo.svg`; reemplázala por el SVG a
 - `allowedUsers`: direcciones autorizadas para toda la instalación; se comprueban también en el modo Google;
 - `auth`: opcional; omítelo para usar Cloudflare Access o configura `{"provider":"google"}` para inicio de sesión Google;
 - `archiveAddress`: buzón de archivo independiente;
-- `appOrigin`, retención, almacenamiento y límites.
+- `appOrigin`, retención, almacenamiento y límites;
+- `maxAttachments` y `maxAttachmentBytes`: máximo de archivos por envío y suma binaria de adjuntos. Los valores seguros para Mailjet Free son 5 archivos y 5 MB; no los aumentes sin revisar el límite total de 15 MB del proveedor, el inflado base64 y la copia de archivo duplicada.
 
 La dirección principal puede aparecer en `identities`; el Worker la conserva una sola vez. No repitas otras direcciones ni uses el archivo como identidad. Se admiten hasta veinte identidades.
 
@@ -58,6 +59,13 @@ Si usas Turso, aplica `turso-migrations/0001_objects.sql` mediante el flujo SQL 
 Ejecuta `npm run deploy:check` para typecheck, pruebas, build, doctor estricto y dry run. Revisa la configuración generada y aplica el procedimiento de publicación de tu empresa; `npm run deploy` realiza el despliegue real.
 
 Comprueba entrada para cada dirección, remitentes From, filtro de bandeja, archivo en Gmail, envío y callback. La aceptación del proveedor no demuestra entrega final.
+
+## Formato, imágenes y adjuntos
+
+- El webmail conserva el HTML del mensaje en un iframe aislado sin scripts ni formularios. Las imágenes CID se resuelven desde el propio MIME; las imágenes remotas quedan bloqueadas hasta que la persona pulse **Mostrar imágenes**.
+- La copia de archivo usa el HTML original saneado, el asunto exacto y un pie mínimo con el botón **Responder en el webmail**. No envuelve el correo en un aviso grande. El remitente técnico sigue siendo la identidad de la empresa autenticada; el nombre visible y el pie identifican al remitente original.
+- Los adjuntos se validan en el navegador y de nuevo en el Worker. Se muestran nombre y tamaño antes de enviar, se pueden quitar y quedan disponibles en Enviados. La copia de archivo incluye el mismo contenido y, en correo entrante, `original.eml`.
+- Los mensajes que superan el tamaño decorado seguro se reenvían de forma nativa para conservar autenticación y adjuntos; en ese caso el botón se envía en un aviso separado.
 
 ## Cuotas y retención
 

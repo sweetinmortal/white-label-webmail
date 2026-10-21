@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { readJson, secured } from '../worker/http';
+import { readFileSync } from 'node:fs';
 
 function jsonRequest(body: BodyInit | null, headers: Record<string, string> = {}): Request {
   return new Request('https://webmail.company.example/api/test', {
@@ -22,6 +23,14 @@ describe('HTTP response security headers', () => {
     expect(response.headers.get('content-security-policy')).toContain("default-src 'self'");
     expect(response.headers.get('content-security-policy')).toContain("object-src 'none'");
     expect(response.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+    expect(response.headers.get('content-security-policy')).toContain("frame-src 'self'");
+    expect(response.headers.get('content-security-policy')).toContain("img-src 'self' blob: data: https:");
+  });
+  it('keeps static asset CSP aligned with API responses for the sandboxed reader', () => {
+    const policy = secured(new Response()).headers.get('content-security-policy')!;
+    const assetPolicy = readFileSync(new URL('../public/_headers', import.meta.url), 'utf8').split('Content-Security-Policy: ')[1].trim();
+    const directives = (value: string) => value.split(';').map((part) => part.trim()).filter(Boolean).sort();
+    expect(directives(assetPolicy)).toEqual(directives(policy));
   });
 });
 

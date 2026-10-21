@@ -4,7 +4,7 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import type { Env, Identity, IncomingEmail, MailConfig } from '../worker/types';
 import { AppError } from '../worker/errors';
 import { seedLocal } from '../worker/dev';
-import { cleanup, deliverIncomingArchive, getMessage, listMessages, processWebhook, receiveEmail, setRead, sendMessage } from '../worker/services/mail';
+import { cleanup, deliverIncomingArchive, getMessage, getOutgoingAttachment, listMessages, processWebhook, receiveEmail, setRead, sendMessage } from '../worker/services/mail';
 import { localProvider } from '../worker/providers/local';
 import type { OutboundMessage } from '../worker/providers/types';
 import { openArchiveReply, sealArchiveReply } from '../worker/services/archive-links';
@@ -222,7 +222,7 @@ class FakeR2 {
 }
 
 function config(mailboxId = 'company-a'): MailConfig {
-  return { brand: { name: 'Mi Empresa', logo: '/logo.svg', primaryColor: '#000', locale: 'es' }, appOrigin: 'https://app.example', mailbox: { id: mailboxId, address: `${mailboxId}@example.com`, name: 'Mailbox' }, archiveAddress: 'archive@example.com', allowedUsers: ['alice@example.com', 'bob@example.com'], retentionDays: 180, cleanupEnabled: true, storageBudgetBytes: 10_000_000, maxMessageBytes: 25 * 1024 * 1024, maxComposeBytes: 100_000, dailyRecipientLimit: 100, monthlyRecipientLimit: 1000, mode: 'local', provider: 'local', accessTeamDomain: 'example.com', accessAudience: 'aud' };
+  return { brand: { name: 'Mi Empresa', logo: '/logo.svg', primaryColor: '#000', locale: 'es' }, appOrigin: 'https://app.example', mailbox: { id: mailboxId, address: `${mailboxId}@example.com`, name: 'Mailbox' }, archiveAddress: 'archive@example.com', allowedUsers: ['alice@example.com', 'bob@example.com'], retentionDays: 180, cleanupEnabled: true, storageBudgetBytes: 10_000_000, maxMessageBytes: 25 * 1024 * 1024, maxComposeBytes: 100_000, maxAttachments: 5, maxAttachmentBytes: 5 * 1024 * 1024, dailyRecipientLimit: 100, monthlyRecipientLimit: 1000, mode: 'local', provider: 'local', accessTeamDomain: 'example.com', accessAudience: 'aud' };
 }
 
 const archiveKey = Buffer.from(Array.from({ length: 32 }, (_, index) => 255 - index)).toString('base64url');
@@ -329,9 +329,75 @@ describe('mail services', () => {
     expect(archived).toBe(true);
     expect(sent).toHaveLength(1);
     const native = sent[0] as any;
-    expect(native.attachments[0]).toMatchObject({ filename: 'original.eml', type: 'application/octet-stream', disposition: 'attachment' });
+    expect(native.attachments[0]).toMatchObject({ filename: 'original.eml', type: 'message/rfc822', disposition: 'attachment' });
     expect(bytesOf(native.attachments[0].content)).toEqual(bytesOf(raw));
     expect(bytesOf(cached)).toEqual(bytesOf(raw));
+  });
+
+  it('preserves sanitized HTML, inline CID images, and ordinary attachments in the archive copy', async () => {
+    const raw = new TextEncoder().encode([
+      'From: Ana <ana@example.net>',
+      'To: company-a@example.com',
+      'Subject: HTML con imagen',
+      'MIME-Version: 1.0',
+      'Content-Type: multipart/mixed; boundary="mix"',
+      '',
+      '--mix',
+      'Content-Type: multipart/related; boundary="rel"',
+      '',
+      '--rel',
+      'Content-Type: text/html; charset=utf-8',
+      'Content-Transfer-Encoding: 8bit',
+      '',
+      '<html><body><p>Hola <b>equipo</b></p><img src="cid:logo@test"><script>bad()</script></body></html>',
+      '--rel',
+      'Content-Type: image/png',
+      'Content-ID: <logo@test>',
+      'Content-Disposition: inline; filename="logo.png"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      'iVBORw0KGgo=',
+      '--rel--',
+      '--mix',
+      'Content-Type: application/pdf; name="doc.pdf"',
+      'Content-Disposition: attachment; filename="doc.pdf"',
+      'Content-Transfer-Encoding: base64',
+      '',
+      'JVBERi0=',
+      '--mix--',
+      '',
+    ].join('\r\n'));
+    const sent: any[] = [];
+    const wrapper = { send: async (value: unknown) => { sent.push(value); return { messageId: 'native-rich-1' }; } } as unknown as SendEmail;
+    const message = rawIncoming(raw, async () => { throw new Error('native delivery should not forward'); });
+    const noDb = { ARCHIVE_LINK_KEY: archiveKey, ARCHIVE_EMAIL_COPY: wrapper, get DB() { throw new Error('archive delivery touched D1'); } } as Env;
+
+    const { archived } = await deliverIncomingArchive(noDb, productionArchiveConfig(), message);
+    expect(archived).toBe(true);
+    expect(sent).toHaveLength(1);
+    const copy = sent[0];
+    expect(copy.html).toContain('<p>Hola <b>equipo</b></p>');
+    expect(copy.html).toContain('cid:logo@test');
+    expect(copy.html).not.toContain('<script>');
+    expect(copy.html).toContain('Responder en el webmail');
+    expect(copy.text).toContain('Hola equipo');
+    expect(copy.attachments).toEqual(expect.arrayContaining([
+      expect.objectContaining({ filename: 'logo.png', type: 'image/png', disposition: 'inline', contentId: 'logo@test' }),
+      expect.objectContaining({ filename: 'doc.pdf', type: 'application/pdf', disposition: 'attachment' }),
+      expect.objectContaining({ filename: 'original.eml', type: 'message/rfc822', disposition: 'attachment' }),
+    ]));
+  });
+
+  it('keeps a nameless original sender visible instead of the archive mailbox owner', async () => {
+    const sent: any[] = [];
+    const wrapper = { send: async (value: unknown) => { sent.push(value); return { messageId: 'nameless-copy' }; } } as unknown as SendEmail;
+    const raw = new TextEncoder().encode('From: sender@example.net\r\nSubject: Archivo\r\n\r\nbody');
+    const message = rawIncoming(raw);
+    message.headers.set('from', 'sender@example.net');
+    const cfg = productionArchiveConfig();
+    await deliverIncomingArchive({ ARCHIVE_LINK_KEY: archiveKey, ARCHIVE_EMAIL_COPY: wrapper } as Env, cfg, message);
+    expect(sent[0].from).toEqual({ email: cfg.mailbox.address, name: 'sender@example.net' });
+    expect(sent[0].replyTo.email).toBe('sender@example.net');
   });
 
   it('falls back to the original forward after wrapper failure and sends a separate archive notice', async () => {
@@ -468,6 +534,59 @@ describe('mail services', () => {
     expect(payload.archiveReplyToken).not.toContain('customer@example.net');
   });
 
+  it('sends, archives, lists, and serves outgoing attachments without changing the idempotency payload', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const cfg = productionArchiveConfig();
+    const fetchMock = vi.fn(async () => Response.json({ Messages: [
+      { Status: 'success', To: [{ Email: 'customer@example.net', MessageID: 551 }] },
+      { Status: 'success', To: [{ Email: 'archive@example.com', MessageID: 552 }] },
+    ] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const e = { ...env(db, storage), ARCHIVE_LINK_KEY: archiveKey, MAILJET_API_KEY: 'test-key', MAILJET_API_SECRET: 'test-secret' } as Env;
+    const input = {
+      to: ['customer@example.net'], subject: 'Con adjunto', text: 'Mira el archivo.',
+      attachments: [{ filename: 'foto.png', mimeType: 'image/png', contentBase64: 'AAEC' }],
+    };
+
+    const sent = await sendMessage(e, cfg, identity(), input, 'outgoing-attachment-key');
+    expect(sent.status).toBe('accepted');
+    const payload = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    expect(payload.Messages).toHaveLength(2);
+    for (const message of payload.Messages) {
+      expect(message.Attachments).toEqual([{ ContentType: 'image/png', Filename: 'foto.png', Base64Content: 'AAEC' }]);
+    }
+
+    const detail = await getMessage(e, cfg, identity(), sent.id);
+    expect(detail.attachments).toEqual([{ filename: 'foto.png', mimeType: 'image/png', sizeBytes: 3 }]);
+    const response = await getOutgoingAttachment(e, cfg, identity(), sent.id, 0);
+    expect(response.headers.get('content-type')).toBe('image/png');
+    expect(response.headers.get('content-disposition')).toContain("filename*=UTF-8''foto.png");
+    expect(Array.from(new Uint8Array(await response.arrayBuffer()))).toEqual([0, 1, 2]);
+
+    await expect(sendMessage(e, cfg, identity(), {
+      ...input,
+      attachments: [{ filename: 'foto.png', mimeType: 'image/png', contentBase64: 'BAUG' }],
+    }, 'outgoing-attachment-key')).rejects.toMatchObject({ code: 'idempotency_mismatch' });
+    expect(fetchMock).toHaveBeenCalledOnce();
+  });
+
+  const attachmentRejectionCases = [
+    { name: 'count', limits: { maxAttachments: 1 }, attachments: [{ filename: 'a.bin', mimeType: 'application/octet-stream', contentBase64: 'AAEC' }, { filename: 'b.bin', mimeType: 'application/octet-stream', contentBase64: 'AAEC' }], error: { code: 'attachment_limit', status: 400 } },
+    { name: 'total size', limits: { maxAttachmentBytes: 2 }, attachments: [{ filename: 'a.bin', mimeType: 'application/octet-stream', contentBase64: 'AAEC' }], error: { code: 'attachment_too_large', status: 413 } },
+    { name: 'MIME type', limits: {}, attachments: [{ filename: 'a.bin', mimeType: 'application/octet-stream; charset=binary', contentBase64: 'AAEC' }], error: { code: 'attachment_type', status: 400 } },
+    { name: 'Base64', limits: {}, attachments: [{ filename: 'a.bin', mimeType: 'application/octet-stream', contentBase64: 'A===' }], error: { code: 'attachment_invalid', status: 400 } },
+  ];
+
+  it.each(attachmentRejectionCases)('rejects outgoing attachments that exceed or violate the $name contract', async ({ limits, attachments, error }) => {
+    const db = new FakeD1();
+    const e = env(db);
+    const input = { to: ['customer@example.net'], subject: 'Attachment check', text: 'body', attachments: attachments.map((attachment) => ({ ...attachment })) };
+
+    await expect(sendMessage(e, { ...config(), ...limits }, identity(), input, 'attachment-validation-attempt'))
+      .rejects.toMatchObject(error);
+    expect(db.quotas.size).toBe(0);
+    expect(db.outboxes.size).toBe(0);
+  });
+
   it('keeps an explicitly addressed archive mailbox in the single annotated Mailjet copy', async () => {
     const db = new FakeD1(); const storage = new FakeR2(); const cfg = productionArchiveConfig();
     const fetchMock = vi.fn(async () => Response.json({ Messages: [
@@ -485,7 +604,7 @@ describe('mail services', () => {
     const mailjetPayload = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
     expect(mailjetPayload.Messages).toHaveLength(1);
     expect(mailjetPayload.Messages[0].To).toEqual([{ Email: 'archive@example.com' }]);
-    expect(mailjetPayload.Messages[0].TextPart).toContain('Copia del correo enviado');
+    expect(mailjetPayload.Messages[0].TextPart).toContain('Copia archivada por Mi Empresa. Remitente original: company-a@example.com.');
     expect(db.recipients).toHaveLength(1);
     expect(db.recipients[0]).toMatchObject({ email: 'archive@example.com', kind: 'to' });
 
@@ -561,7 +680,7 @@ describe('mail services', () => {
   });
 
   it('uses simulated IDs only for an explicitly local provider', async () => {
-    const message: OutboundMessage = { id: 'm1', from: { email: 'company-a@example.com' }, to: [{ email: 'to@example.net', kind: 'to' }], subject: 's', text: 't', headers: {}, customId: 'm1', archiveAddress: 'archive@example.com' };
+    const message: OutboundMessage = { id: 'm1', from: { email: 'company-a@example.com' }, to: [{ email: 'to@example.net', kind: 'to' }], subject: 's', text: 't', attachments: [], headers: {}, customId: 'm1', archiveAddress: 'archive@example.com' };
     const result = await localProvider.send({} as Env, config(), message);
     expect(result.outcome).toBe('accepted'); expect(result.recipients[0].providerId).toBe('local-m1-1');
     const production = { ...config(), mode: 'production' as const, provider: 'local' as const };

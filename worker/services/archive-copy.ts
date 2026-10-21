@@ -1,26 +1,49 @@
 import type { MailConfig } from '../types';
+import { textToHtml } from '../../shared/email-html';
 import { archiveReplyUrl } from './archive-links';
 
 function escape(value: string): string {
   return value.replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character]!));
 }
+
 export interface ArchiveCopyContent { text: string; html: string }
-export function archiveCopyContent(config: MailConfig, input: {
-  direction: 'incoming' | 'outgoing'; token: string; subject: string;
-  sender: string; recipients: string[]; text?: string; originalAttached?: boolean;
-}): ArchiveCopyContent {
+
+export interface ArchiveCopyInput {
+  direction: 'incoming' | 'outgoing';
+  token: string;
+  subject: string;
+  sender: string;
+  senderName?: string;
+  recipients: string[];
+  text?: string;
+  html?: string;
+  htmlStyles?: string;
+  originalAttached?: boolean;
+  notice?: boolean;
+}
+
+export function archiveCopyContent(config: MailConfig, input: ArchiveCopyInput): ArchiveCopyContent {
   const url = archiveReplyUrl(config, input.token);
-  const instruction = 'Esta es una copia de archivo. No respondas desde Gmail: responde siempre desde el webmail de la empresa.';
-  const title = input.direction === 'incoming' ? 'Copia del correo recibido' : 'Copia del correo enviado';
-  const originalNote = input.originalAttached
-    ? 'El correo original completo, incluidos sus adjuntos, se conserva en original.eml.'
-    : input.text === undefined ? 'El correo original se conserva en esta misma conversación de Gmail.' : '';
-  const text = [config.brand.name, title, instruction, `Responder en el webmail: ${url}`, originalNote,
-    `Asunto: ${input.subject}`, `De: ${input.sender}`, `Para: ${input.recipients.join(', ')}`,
-    ...(input.text === undefined ? [] : ['', input.text]),
-  ].filter(value => value !== '').join('\n\n');
+  const senderLabel = input.senderName ? `${input.senderName} <${input.sender}>` : input.sender;
+  const archiveLine = `Copia archivada por ${config.brand.name}. Remitente original: ${senderLabel}.`;
+  const attachmentLine = input.originalAttached ? 'El original completo está adjunto como original.eml.' : '';
+  const textParts = input.notice
+    ? [archiveLine, `Responder en el webmail: ${url}`]
+    : [
+        ...(input.text ? [input.text] : []),
+        '--',
+        archiveLine,
+        'Para responder, usa el webmail; no respondas desde Gmail.',
+        `Responder en el webmail: ${url}`,
+        ...(attachmentLine ? [attachmentLine] : []),
+      ];
+  const text = textParts.join('\n\n');
   const color = /^#[a-f0-9]{6}$/i.test(config.brand.primaryColor) ? config.brand.primaryColor : '#0875d1';
-  const html = `<!doctype html><html lang="es"><body style="margin:0;background:#f4f6f8;font-family:Arial,sans-serif;color:#162235"><table role="presentation" style="width:100%;border-collapse:collapse"><tr><td style="padding:24px 12px"><table role="presentation" style="width:100%;max-width:640px;margin:auto;background:white;border:1px solid #e1e7ef;border-radius:12px"><tr><td style="padding:24px"><h2 style="margin:0 0 12px;color:${color}">${escape(config.brand.name)}</h2><p style="font-weight:bold">${title}</p><p>${instruction}</p><p style="margin:24px 0"><a href="${escape(url)}" style="display:inline-block;background:${color};color:white;text-decoration:none;padding:14px 20px;border-radius:8px;font-weight:bold">Responder en el webmail</a></p>${originalNote ? `<p style="font-size:13px;color:#526071">${originalNote}</p>` : ''}<hr style="border:0;border-top:1px solid #e1e7ef"><p><strong>Asunto:</strong> ${escape(input.subject)}<br><strong>De:</strong> ${escape(input.sender)}<br><strong>Para:</strong> ${escape(input.recipients.join(', '))}</p>${input.text === undefined ? '' : `<div style="white-space:pre-wrap;overflow-wrap:anywhere">${escape(input.text)}</div>`}<p style="font-size:12px;color:#526071">El botón abre ${escape(config.appOrigin)} y requiere una sesión autorizada.</p></td></tr></table></td></tr></table></body></html>`;
+  const body = input.notice ? '' : input.html
+    ? `${input.htmlStyles ? `<style>${input.htmlStyles}</style>` : ''}${input.html}`
+    : input.text ? textToHtml(input.text) : '';
+  const footer = `<div style="margin-top:24px;padding-top:12px;border-top:1px solid #e5e7eb;font:13px/1.5 Arial,sans-serif;color:#6b7280"><a href="${escape(url)}" style="display:inline-block;margin:0 0 8px;padding:7px 12px;border:1px solid ${color};border-radius:6px;color:${color};text-decoration:none;font-weight:600">Responder en el webmail</a><br>Para responder, usa el webmail; no respondas desde Gmail.<br>${escape(archiveLine)}${attachmentLine ? `<br>${escape(attachmentLine)}` : ''}</div>`;
+  const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(input.subject || 'Correo')}</title></head><body style="margin:0;padding:0;background:#ffffff">${body}${footer}</body></html>`;
   return { text, html };
 }
 
