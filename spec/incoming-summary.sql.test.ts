@@ -66,6 +66,9 @@ describe('summary queue on real D1', () => {
     expect(result.released).toBe(1);
     expect(await pendingSummaryCount(db, 'mailbox')).toBe(10);
     const accepted = await claimSummaryBatch(db, 'mailbox', 5);
+    // Releasing a claim that never reached the provider must not consume a
+    // definitive-send retry.
+    expect(accepted?.items.every((item) => item.attempts === 1)).toBe(true);
     await db.prepare(`UPDATE mail_summary_batches SET status = 'sending', updated_at = '2000-01-01T00:00:00.000Z' WHERE id = ?`).bind(accepted!.batch.id).run();
     const ambiguous = await recoverStaleSummaryBatches(db, 'mailbox');
     expect(ambiguous.unknown).toBe(1);

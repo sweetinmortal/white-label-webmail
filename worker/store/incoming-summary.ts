@@ -112,7 +112,7 @@ export async function claimSummaryBatch(db: D1Database, mailboxId: string, batch
 
 async function releaseClaimedBatch(db: D1Database, batchId: string, reason: string): Promise<void> {
   await db.batch([
-    db.prepare(`UPDATE mail_summary_items SET status = 'pending', batch_id = NULL, claimed_at = NULL, error_code = ? WHERE batch_id = ? AND status = 'claimed'`).bind(reason, batchId),
+    db.prepare(`UPDATE mail_summary_items SET status = 'pending', batch_id = NULL, claimed_at = NULL, error_code = ?, attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END WHERE batch_id = ? AND status = 'claimed'`).bind(reason, batchId),
     db.prepare(`DELETE FROM mail_summary_batches WHERE id = ?`).bind(batchId),
   ]);
 }
@@ -152,7 +152,7 @@ export async function recoverStaleSummaryBatches(db: D1Database, mailboxId: stri
     if (row.status === 'claiming') {
       await db.batch([
         db.prepare(`UPDATE mail_summary_batches SET status = 'failed', error_code = 'recovered_before_send', updated_at = ? WHERE id = ? AND status = 'claiming'`).bind(at, row.id),
-        db.prepare(`UPDATE mail_summary_items SET status = 'pending', batch_id = NULL, claimed_at = NULL, error_code = 'recovered_before_send' WHERE batch_id = ? AND status = 'claimed'`).bind(row.id),
+        db.prepare(`UPDATE mail_summary_items SET status = 'pending', batch_id = NULL, claimed_at = NULL, error_code = 'recovered_before_send', attempts = CASE WHEN attempts > 0 THEN attempts - 1 ELSE 0 END WHERE batch_id = ? AND status = 'claimed'`).bind(row.id),
       ]);
       released += 1;
     } else {
