@@ -503,6 +503,17 @@ describe('mail services', () => {
     expect(sent[0].html).toContain('&lt;img src=x onerror=alert(1)&gt;');
   });
 
+  it('sanitizes control characters before sealing summary reply links', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
+    const e = summaryEnvironment(db, storage, sent);
+    for (let index = 0; index < 4; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Nombre ${index}`).message);
+    for (const item of db.summaryItems.values()) item.subject = 'Hola\tmundo\x01';
+    await receiveEmail(e, summaryConfig(), incoming('Nombre final').message);
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toContain('Hola mundo');
+    expect(sent[0].text).not.toContain('\x01');
+  });
+
   it('forwards a duplicate Message-ID only once and consumes one summary slot', async () => {
     const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
     const e = summaryEnvironment(db, storage, sent);

@@ -48,6 +48,14 @@ function summarySubject(config: MailConfig, count: number): string {
   return `Resumen de ${count} correos recibidos · ${config.brand.name}`.slice(0, 255);
 }
 
+function cleanSubject(value: string): string {
+  return value.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function replySubject(value: string): string {
+  return (cleanSubject(value) || 'Correo recibido').slice(0, 251);
+}
+
 function summaryContent(config: MailConfig, items: Array<SummaryItemRow & { url: string }>): { text: string; html: string } {
   const timeZone = config.incomingSummary?.timeZone ?? 'UTC';
   const notice = 'Responde desde el webmail para conservar la identidad institucional y el hilo del mensaje. No respondas a este resumen.';
@@ -57,7 +65,7 @@ function summaryContent(config: MailConfig, items: Array<SummaryItemRow & { url:
     '',
     ...items.flatMap((item, index) => [
       `${index + 1}. ${item.sender_name ? `${item.sender_name} <${item.sender_email}>` : item.sender_email}`,
-      `Asunto: ${item.subject || '(sin asunto)'}`,
+      `Asunto: ${cleanSubject(item.subject) || '(sin asunto)'}`,
       `Recibido en: ${item.recipient_address}`,
       `Fecha: ${formatDate(item.received_at, config.brand.locale, timeZone)}`,
       `Responder en el webmail: ${item.url}`,
@@ -70,7 +78,7 @@ function summaryContent(config: MailConfig, items: Array<SummaryItemRow & { url:
     const sender = item.sender_name ? `${escape(item.sender_name)} &lt;${escape(item.sender_email)}&gt;` : escape(item.sender_email);
     return `<li style="margin:0 0 16px;padding:16px;border:1px solid #e5e7eb;border-radius:8px;background:#ffffff;list-style:none">
       <div style="font:600 15px/1.4 Arial,sans-serif;color:#111827">${index + 1}. ${sender}</div>
-      <div style="margin-top:7px;font:600 16px/1.4 Arial,sans-serif;color:#111827">${escape(item.subject || '(sin asunto)')}</div>
+      <div style="margin-top:7px;font:600 16px/1.4 Arial,sans-serif;color:#111827">${escape(cleanSubject(item.subject) || '(sin asunto)')}</div>
       <div style="margin-top:7px;font:13px/1.55 Arial,sans-serif;color:#4b5563">Recibido en: ${escape(item.recipient_address)}</div>
       <div style="font:13px/1.55 Arial,sans-serif;color:#4b5563">Fecha: ${escape(formatDate(item.received_at, config.brand.locale, timeZone))}</div>
       <a href="${escape(item.url)}" style="display:inline-block;margin-top:12px;padding:8px 13px;border:1px solid ${color};border-radius:6px;color:${color};text-decoration:none;font:600 14px/1.2 Arial,sans-serif">Responder en el webmail</a>
@@ -92,7 +100,7 @@ export async function sendSummaryBatch(env: Env, config: MailConfig, claimed: Cl
         from: item.reply_from,
         to: parseJson<string[]>(item.reply_to_json, []).filter((email) => typeof email === 'string').slice(0, 10),
         cc: [],
-        subject: (item.subject || 'Correo recibido').slice(0, 251),
+        subject: replySubject(item.subject),
         ...(item.in_reply_to ? { inReplyTo: item.in_reply_to } : {}),
         references: parseJson<string[]>(item.references_json, []).slice(0, 5),
       });
