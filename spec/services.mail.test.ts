@@ -4,7 +4,7 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import type { Env, Identity, IncomingEmail, MailConfig } from '../worker/types';
 import { AppError } from '../worker/errors';
 import { seedLocal } from '../worker/dev';
-import { cleanup, deliverIncomingArchive, getMessage, getOutgoingAttachment, listMessages, processWebhook, receiveEmail, setRead, sendMessage } from '../worker/services/mail';
+import { cleanup, getMessage, getOutgoingAttachment, listMessages, processWebhook, receiveEmail, setRead, sendMessage } from '../worker/services/mail';
 import { localProvider } from '../worker/providers/local';
 import type { OutboundMessage } from '../worker/providers/types';
 import { openArchiveReply, sealArchiveReply } from '../worker/services/archive-links';
@@ -30,6 +30,8 @@ class FakeD1 {
   outboxes = new Map<string, StoredMessage>();
   recipients: StoredMessage[] = [];
   webhookEvents = new Set<string>();
+  summaryItems = new Map<string, StoredMessage>();
+  summaryBatches = new Map<string, StoredMessage>();
   failWebhookBatchOnce = false;
   prepare(sql: string) { return new FakeStatement(this, sql); }
   async batch(statements: FakeStatement[]) {
@@ -89,6 +91,96 @@ class FakeD1 {
     if (sql.startsWith('DELETE FROM mail_read_states')) {
       this.reads.delete(`${args[0]}|${args[1]}`); return result(1);
     }
+    if (sql.startsWith('INSERT OR IGNORE INTO mail_summary_items')) {
+      const [messageId, mailboxId, senderEmail, senderName, subject, recipientAddress, receivedAt, replyFrom, replyToJson, inReplyTo, referencesJson, createdAt] = args;
+      if (this.summaryItems.has(messageId)) return result();
+      this.summaryItems.set(messageId, { message_id: messageId, mailbox_id: mailboxId, batch_id: null, status: 'pending', sender_email: senderEmail, sender_name: senderName, subject, recipient_address: recipientAddress, received_at: receivedAt, reply_from: replyFrom, reply_to_json: replyToJson, in_reply_to: inReplyTo, references_json: referencesJson, created_at: createdAt, claimed_at: null, error_code: null, attempts: 0 });
+      return result(1);
+    }
+    if (sql.startsWith('INSERT INTO mail_summary_batches')) {
+      const [id, mailboxId, itemCount, createdAt, updatedAt] = args;
+      this.summaryBatches.set(id, { id, mailbox_id: mailboxId, status: 'claiming', item_count: itemCount, provider_message_id: null, error_code: null, created_at: createdAt, updated_at: updatedAt });
+      return result(1);
+    }
+    if (sql.startsWith("UPDATE mail_summary_items SET status = 'claimed'")) {
+      const [batchId, claimedAt, mailboxId, maxAttempts, limit] = args;
+      const rows = [...this.summaryItems.values()]
+        .filter((row) => row.mailbox_id === mailboxId && row.status === 'pending' && row.attempts < maxAttempts)
+        .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.message_id.localeCompare(b.message_id))
+        .slice(0, limit);
+      for (const row of rows) {
+        row.status = 'claimed'; row.batch_id = batchId; row.claimed_at = claimedAt; row.error_code = null; row.attempts += 1;
+      }
+      return result(rows.length);
+    }
+    if (sql.startsWith("UPDATE mail_summary_batches SET status = 'sending'")) {
+      const [updatedAt, id] = args;
+      const row = this.summaryBatches.get(id);
+      if (!row || row.status !== 'claiming') return result();
+      row.status = 'sending'; row.updated_at = updatedAt;
+      return result(1);
+    }
+    if (sql.startsWith('UPDATE mail_summary_batches SET status = ?')) {
+      const [status, providerMessageId, errorCode, updatedAt, id] = args;
+      const row = this.summaryBatches.get(id);
+      if (row) { row.status = status; row.provider_message_id = providerMessageId; row.error_code = errorCode; row.updated_at = updatedAt; }
+      return result(row ? 1 : 0);
+    }
+    if (sql.startsWith("UPDATE mail_summary_items SET status = CASE")) {
+      const [maxAttempts, , , errorCode, batchId] = args;
+      let changes = 0;
+      for (const row of this.summaryItems.values()) {
+        if (row.batch_id === batchId && row.status === 'claimed') {
+          if (row.attempts >= maxAttempts) row.status = 'failed';
+          else { row.status = 'pending'; row.batch_id = null; row.claimed_at = null; }
+          row.error_code = errorCode; changes += 1;
+        }
+      }
+      return result(changes);
+    }
+    if (sql.startsWith("UPDATE mail_summary_items SET status = ?, error_code = ? WHERE batch_id = ?")) {
+      const [status, errorCode, batchId] = args;
+      let changes = 0;
+      for (const row of this.summaryItems.values()) {
+        if (row.batch_id === batchId && row.status === 'claimed') { row.status = status; row.error_code = errorCode; changes += 1; }
+      }
+      return result(changes);
+    }
+    if (sql.startsWith("UPDATE mail_summary_items SET status = 'pending'")) {
+      const [errorCode, batchId] = args;
+      let changes = 0;
+      for (const row of this.summaryItems.values()) {
+        if (row.batch_id === batchId && row.status === 'claimed') {
+          row.status = 'pending'; row.batch_id = null; row.claimed_at = null; row.error_code = errorCode; changes += 1;
+        }
+      }
+      return result(changes);
+    }
+    if (sql.startsWith("UPDATE mail_summary_batches SET status = 'failed'")) {
+      const [updatedAt, id] = args;
+      const row = this.summaryBatches.get(id);
+      if (row && row.status === 'claiming') { row.status = 'failed'; row.error_code = 'recovered_before_send'; row.updated_at = updatedAt; return result(1); }
+      return result();
+    }
+    if (sql.startsWith("UPDATE mail_summary_batches SET status = 'unknown'")) {
+      const [updatedAt, id] = args;
+      const row = this.summaryBatches.get(id);
+      if (row && row.status === 'sending') { row.status = 'unknown'; row.error_code = 'send_outcome_unknown'; row.updated_at = updatedAt; return result(1); }
+      return result();
+    }
+    if (sql.startsWith("UPDATE mail_summary_items SET status = 'unknown'")) {
+      const [batchId] = args;
+      let changes = 0;
+      for (const row of this.summaryItems.values()) {
+        if (row.batch_id === batchId && row.status === 'claimed') { row.status = 'unknown'; row.error_code = 'send_outcome_unknown'; changes += 1; }
+      }
+      return result(changes);
+    }
+    if (sql.startsWith('DELETE FROM mail_summary_batches WHERE id = ?')) {
+      return result(this.summaryBatches.delete(args[0]) ? 1 : 0);
+    }
+    if (sql.startsWith('DELETE FROM mail_summary_batches WHERE id IN')) return result();
+    if (sql.startsWith('DELETE FROM mail_summary_items WHERE message_id IN')) return result();
     if (sql.includes("INSERT INTO mail_messages") && sql.includes("'outgoing'")) {
       const [id, mailboxId, fromEmail, fromName, toJson, ccJson, subject, replyToJson, rfcMessageId, referencesJson, bodyText, payloadKey, sizeBytes, createdAt, sentAt, expiresAt, archiveAddress] = args;
       this.messages.push({ id, mailbox_id: mailboxId, direction: 'outgoing', from_email: fromEmail, from_name: fromName, to_json: toJson, cc_json: ccJson, subject, reply_to_json: replyToJson, rfc_message_id: rfcMessageId, references_json: referencesJson, body_text: bodyText, raw_key: null, payload_key: payloadKey, size_bytes: sizeBytes, created_at: createdAt, received_at: null, sent_at: sentAt, expires_at: expiresAt, receipt_id: null, archive_address: archiveAddress, archive_status: 'pending', send_status: 'pending', delete_state: 'active' });
@@ -147,8 +239,11 @@ class FakeD1 {
     if (sql.startsWith('DELETE FROM mail_messages WHERE')) { this.messages = this.messages.filter((item) => item.id !== args[0]); return result(1); }
     if (sql.startsWith('DELETE FROM mail_idempotency_tombstones') || sql.startsWith('DELETE FROM mail_webhook_events')) return result(1);
     if (sql.includes("INSERT INTO mail_messages") && sql.includes("'incoming'")) {
-      const [id, mailboxId, fromEmail, fromName, toJson, ccJson, subject, replyToJson, rfcMessageId, referencesJson, rawKey, sizeBytes, createdAt, receivedAt, expiresAt, receiptId, archiveAddress, archiveStatus] = args;
-      this.messages.push({ id, mailbox_id: mailboxId, direction: 'incoming', from_email: fromEmail, from_name: fromName, to_json: toJson, cc_json: ccJson, subject, reply_to_json: replyToJson, rfc_message_id: rfcMessageId, references_json: referencesJson, raw_key: rawKey, payload_key: null, body_text: null, size_bytes: sizeBytes, created_at: createdAt, received_at: receivedAt, expires_at: expiresAt, receipt_id: receiptId, archive_address: archiveAddress, archive_status: archiveStatus, send_status: null, delete_state: 'active' });
+      const [id, mailboxId, fromEmail, fromName, toJson, ccJson, subject, replyToJson, rfcMessageId, referencesJson, rawKey, sizeBytes, createdAt, receivedAt, expiresAt, receiptId, archiveAddress, archiveStatus, incomingKey] = args;
+      if (incomingKey && this.messages.some((row) => row.mailbox_id === mailboxId && row.incoming_key === incomingKey)) {
+        throw new Error('UNIQUE constraint failed: mail_messages.mailbox_id, mail_messages.incoming_key');
+      }
+      this.messages.push({ id, mailbox_id: mailboxId, direction: 'incoming', from_email: fromEmail, from_name: fromName, to_json: toJson, cc_json: ccJson, subject, reply_to_json: replyToJson, rfc_message_id: rfcMessageId, references_json: referencesJson, raw_key: rawKey, payload_key: null, body_text: null, size_bytes: sizeBytes, created_at: createdAt, received_at: receivedAt, expires_at: expiresAt, receipt_id: receiptId, archive_address: archiveAddress, archive_status: archiveStatus, send_status: null, delete_state: 'active', incoming_key: incomingKey });
       return result(1);
     }
     if (sql.includes('UPDATE mail_messages SET delete_state')) {
@@ -159,6 +254,14 @@ class FakeD1 {
     return result();
   }
   async first<T = any>(sql: string, args: any[]): Promise<T | null> {
+    if (sql.includes('SELECT id FROM mail_messages WHERE mailbox_id = ? AND incoming_key = ?')) {
+      const row = this.messages.find((item) => item.mailbox_id === args[0] && item.incoming_key === args[1]);
+      return (row ? { id: row.id } : null) as T;
+    }
+    if (sql.includes('SELECT COUNT(*) AS count FROM mail_summary_items')) {
+      const count = [...this.summaryItems.values()].filter((row) => row.mailbox_id === args[0] && row.status === 'pending' && row.attempts < args[1]).length;
+      return { count } as T;
+    }
     if (sql.includes('SELECT used_bytes')) {
       const row = this.storage.get(args[0]);
       return (row ? { used_bytes: row.used, budget_bytes: row.budget, paused: row.paused } : null) as T;
@@ -186,6 +289,19 @@ class FakeD1 {
     return null;
   }
   async all<T = any>(sql: string, args: any[]): Promise<{ results: T[] }> {
+    if (sql.includes('FROM mail_summary_items WHERE batch_id = ?')) {
+      const rows = [...this.summaryItems.values()]
+        .filter((row) => row.batch_id === args[0])
+        .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.message_id.localeCompare(b.message_id));
+      return { results: rows as T[] };
+    }
+    if (sql.includes('FROM mail_summary_batches WHERE mailbox_id = ?')) {
+      const rows = [...this.summaryBatches.values()]
+        .filter((row) => row.mailbox_id === args[0] && ['claiming', 'sending'].includes(row.status) && row.updated_at <= args[1])
+        .sort((a, b) => a.updated_at.localeCompare(b.updated_at))
+        .slice(0, args[2]);
+      return { results: rows.map((row) => ({ id: row.id, status: row.status })) as T[] };
+    }
     if (sql.includes('ORDER BY m.created_at DESC')) {
       const userEmail = args[0];
       const mailboxId = args[1];
@@ -229,6 +345,26 @@ const archiveKey = Buffer.from(Array.from({ length: 32 }, (_, index) => 255 - in
 function productionArchiveConfig(): MailConfig {
   return { ...config(), mode: 'production', provider: 'mailjet', archiveCopies: { enabled: true, maxDecoratedBytes: 3 * 1024 * 1024 } };
 }
+function summaryConfig(batchSize = 5): MailConfig {
+  return {
+    ...config(),
+    incomingSummary: {
+      enabled: true,
+      batchSize,
+      from: { email: 'webmail@example.com', name: 'Webmail de Mi Empresa' },
+      timeZone: 'UTC',
+    },
+  };
+}
+function summaryEnvironment(db: FakeD1, storage: FakeR2, sent: any[]): Env {
+  const wrapper = {
+    send: async (value: unknown) => {
+      sent.push(value);
+      return { messageId: `summary-${sent.length}` };
+    },
+  } as unknown as SendEmail;
+  return { ...env(db, storage), ARCHIVE_LINK_KEY: archiveKey, ARCHIVE_EMAIL_COPY: wrapper };
+}
 function archiveEnvironment(db: FakeD1, mail: FakeR2, copy: SendEmail): Env {
   return { ...env(db, mail), ARCHIVE_LINK_KEY: archiveKey, ARCHIVE_EMAIL_COPY: copy };
 }
@@ -247,15 +383,16 @@ afterEach(() => vi.unstubAllGlobals());
 function env(db: FakeD1, mail = new FakeR2()): Env { return { DB: db as any, MAIL: mail as any, ASSETS: {} as Fetcher }; }
 function identity(mailboxId = 'company-a', email = 'alice@example.com'): Identity { return { email, mailboxIds: [mailboxId] }; }
 
-function incoming(subject: string, forwardResult = true): { message: IncomingEmail; rejected: string[]; forwarded: string[] } {
+let incomingSequence = 0;
+function incoming(subject: string, forwardResult = true, messageId = `<incoming-${++incomingSequence}@example.net>`, recipient = 'company-a@example.com'): { message: IncomingEmail; rejected: string[]; forwarded: string[] } {
   const rejected: string[] = []; const forwarded: string[] = [];
-  const raw = new TextEncoder().encode(`From: sender@example.net\r\nSubject: ${subject}\r\nMessage-ID: <same@example.net>\r\n\r\nhello`);
-  const message: IncomingEmail = { from: 'sender@example.net', to: 'company-a@example.com', raw: new Blob([raw]).stream() as any, rawSize: raw.byteLength, headers: new Headers({ subject, 'message-id': '<same@example.net>', to: 'company-a@example.com' }), forward: async (address) => { forwarded.push(address); if (!forwardResult) throw new Error('forward failed'); }, setReject: (reason) => rejected.push(reason) };
+  const raw = new TextEncoder().encode(`From: sender@example.net\r\nSubject: ${subject}\r\nMessage-ID: ${messageId}\r\n\r\nhello`);
+  const message: IncomingEmail = { from: 'sender@example.net', to: recipient, raw: new Blob([raw]).stream() as any, rawSize: raw.byteLength, headers: new Headers({ subject, 'message-id': messageId, to: recipient, from: 'sender@example.net' }), forward: async (address) => { forwarded.push(address); if (!forwardResult) throw new Error('forward failed'); }, setReject: (reason) => rejected.push(reason) };
   return { message, rejected, forwarded };
 }
 
 describe('mail services', () => {
-  it('stores inbound copies, keeps duplicate RFC Message-IDs, lists unread, and scopes mailbox access', async () => {
+  it('stores inbound copies, lists unread, and scopes mailbox access', async () => {
     const db = new FakeD1(); const storage = new FakeR2(); const e = env(db, storage); const cfg = config();
     await receiveEmail(e, cfg, incoming('one').message); await receiveEmail(e, cfg, incoming('two').message);
     const page = await listMessages(e, cfg, identity(), 'inbox');
@@ -305,157 +442,85 @@ describe('mail services', () => {
     expect([...db.storage.values()].every((row) => row.used === 0)).toBe(true);
   });
 
-  it('delivers a native archive copy without touching D1 and preserves the exact original bytes in both paths', async () => {
+  it('forwards the untouched original and never sends a decorated archive copy', async () => {
+    const db = new FakeD1(); const storage = new FakeR2();
     const raw = Uint8Array.from([
       ...new TextEncoder().encode('From: sender@example.net\r\nSubject: Archivo\r\n\r\n'),
       0, 255, 128, 13, 10, 65,
     ]);
     const sent: any[] = [];
-    const wrapper = { send: async (value: unknown) => { sent.push(value); return { messageId: 'native-archive-1' }; } } as unknown as SendEmail;
-    const message = rawIncoming(raw, async () => { throw new Error('native delivery should not forward'); });
-    const noDb = {
-      ARCHIVE_LINK_KEY: archiveKey,
-      ARCHIVE_EMAIL_COPY: wrapper,
-      get DB() { throw new Error('archive delivery touched D1'); },
-    } as Env;
+    const wrapper = { send: async (value: unknown) => { sent.push(value); return { messageId: 'unexpected-copy' }; } } as unknown as SendEmail;
+    const events: string[] = [];
+    const message = rawIncoming(raw, async (address) => { events.push(address); });
 
-    const { archived, cacheRaw } = await deliverIncomingArchive(noDb, productionArchiveConfig(), message);
-    const cachedParts: Uint8Array[] = [];
-    const reader = cacheRaw.getReader();
-    while (true) { const next = await reader.read(); if (next.done) break; cachedParts.push(next.value); }
-    const cached = new Uint8Array(cachedParts.reduce((total, part) => total + part.byteLength, 0));
-    let offset = 0; for (const part of cachedParts) { cached.set(part, offset); offset += part.byteLength; }
+    await receiveEmail(archiveEnvironment(db, storage, wrapper), productionArchiveConfig(), message);
 
-    expect(archived).toBe(true);
+    expect(events).toEqual(['archive@example.com']);
+    expect(sent).toHaveLength(0);
+    expect(db.messages).toHaveLength(1);
+    expect(db.messages[0].archive_status).toBe('forward_accepted');
+    expect(bytesOf([...storage.objects.values()][0])).toEqual(bytesOf(raw));
+  });
+
+  it('does not let a summary failure block native forwarding or the cached original', async () => {
+    const db = new FakeD1(); const storage = new FakeR2();
+    const rejected: string[] = []; const forwarded: string[] = [];
+    const wrapper = { send: async () => { throw new Error('summary provider unavailable'); } } as unknown as SendEmail;
+    const e = { ...env(db, storage), ARCHIVE_LINK_KEY: archiveKey, ARCHIVE_EMAIL_COPY: wrapper } as Env;
+    for (let index = 0; index < 5; index += 1) {
+      const item = incoming(`Resumen ${index}`);
+      item.message.forward = async (address) => { forwarded.push(address); };
+      item.message.setReject = (reason) => rejected.push(reason);
+      await receiveEmail(e, summaryConfig(), item.message);
+    }
+    expect(forwarded).toHaveLength(5);
+    expect(rejected).toHaveLength(0);
+    expect(storage.objects.size).toBe(5);
+    expect(db.messages).toHaveLength(5);
+    expect([...db.summaryItems.values()].every((item) => item.status === 'unknown')).toBe(true);
+  });
+
+  it('forwards an oversized original first and keeps it out of the summary count', async () => {
+    const db = new FakeD1(); const storage = new FakeR2();
+    const events: string[] = []; const sent: any[] = [];
+    const raw = new Uint8Array(config().maxMessageBytes + 1);
+    const message = rawIncoming(raw, async () => { events.push('forward'); });
+    await receiveEmail(archiveEnvironment(db, storage, { send: async (value: unknown) => { sent.push(value); return { messageId: 'nope' }; } } as unknown as SendEmail), summaryConfig(), message);
+    expect(events).toEqual(['forward']);
+    expect(sent).toHaveLength(0);
+    expect(db.messages).toHaveLength(0);
+    expect(db.summaryItems.size).toBe(0);
+  });
+
+  it('escapes sender display names in the summary HTML', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
+    const e = summaryEnvironment(db, storage, sent);
+    for (let index = 0; index < 4; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Nombre ${index}`).message);
+    for (const item of db.summaryItems.values()) item.sender_name = '<img src=x onerror=alert(1)>';
+    await receiveEmail(e, summaryConfig(), incoming('Nombre final').message);
     expect(sent).toHaveLength(1);
-    const native = sent[0] as any;
-    expect(native.attachments[0]).toMatchObject({ filename: 'original.eml', type: 'message/rfc822', disposition: 'attachment' });
-    expect(bytesOf(native.attachments[0].content)).toEqual(bytesOf(raw));
-    expect(bytesOf(cached)).toEqual(bytesOf(raw));
+    expect(sent[0].html).not.toContain('<img');
+    expect(sent[0].html).toContain('&lt;img src=x onerror=alert(1)&gt;');
   });
 
-  it('preserves sanitized HTML, inline CID images, and ordinary attachments in the archive copy', async () => {
-    const raw = new TextEncoder().encode([
-      'From: Ana <ana@example.net>',
-      'To: company-a@example.com',
-      'Subject: HTML con imagen',
-      'MIME-Version: 1.0',
-      'Content-Type: multipart/mixed; boundary="mix"',
-      '',
-      '--mix',
-      'Content-Type: multipart/related; boundary="rel"',
-      '',
-      '--rel',
-      'Content-Type: text/html; charset=utf-8',
-      'Content-Transfer-Encoding: 8bit',
-      '',
-      '<html><body><p>Hola <b>equipo</b></p><img src="cid:logo@test"><script>bad()</script></body></html>',
-      '--rel',
-      'Content-Type: image/png',
-      'Content-ID: <logo@test>',
-      'Content-Disposition: inline; filename="logo.png"',
-      'Content-Transfer-Encoding: base64',
-      '',
-      'iVBORw0KGgo=',
-      '--rel--',
-      '--mix',
-      'Content-Type: application/pdf; name="doc.pdf"',
-      'Content-Disposition: attachment; filename="doc.pdf"',
-      'Content-Transfer-Encoding: base64',
-      '',
-      'JVBERi0=',
-      '--mix--',
-      '',
-    ].join('\r\n'));
-    const sent: any[] = [];
-    const wrapper = { send: async (value: unknown) => { sent.push(value); return { messageId: 'native-rich-1' }; } } as unknown as SendEmail;
-    const message = rawIncoming(raw, async () => { throw new Error('native delivery should not forward'); });
-    const noDb = { ARCHIVE_LINK_KEY: archiveKey, ARCHIVE_EMAIL_COPY: wrapper, get DB() { throw new Error('archive delivery touched D1'); } } as Env;
-
-    const { archived } = await deliverIncomingArchive(noDb, productionArchiveConfig(), message);
-    expect(archived).toBe(true);
+  it('forwards a duplicate Message-ID only once and consumes one summary slot', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
+    const e = summaryEnvironment(db, storage, sent);
+    const duplicateId = '<duplicate@example.net>';
+    for (let index = 0; index < 4; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Único ${index}`).message);
+    const first = incoming('Duplicado', true, duplicateId);
+    const second = incoming('Duplicado', true, duplicateId);
+    await receiveEmail(e, summaryConfig(), first.message);
+    await receiveEmail(e, summaryConfig(), second.message);
+    expect(first.forwarded).toHaveLength(1);
+    expect(second.forwarded).toHaveLength(0);
+    expect(db.messages).toHaveLength(5);
     expect(sent).toHaveLength(1);
-    const copy = sent[0];
-    expect(copy.html).toContain('<p>Hola <b>equipo</b></p>');
-    expect(copy.html).toContain('cid:logo@test');
-    expect(copy.html).not.toContain('<script>');
-    expect(copy.html).toContain('Responder en el webmail');
-    expect(copy.text).toContain('Hola equipo');
-    expect(copy.attachments).toEqual(expect.arrayContaining([
-      expect.objectContaining({ filename: 'logo.png', type: 'image/png', disposition: 'inline', contentId: 'logo@test' }),
-      expect.objectContaining({ filename: 'doc.pdf', type: 'application/pdf', disposition: 'attachment' }),
-      expect.objectContaining({ filename: 'original.eml', type: 'message/rfc822', disposition: 'attachment' }),
-    ]));
+    expect([...db.summaryItems.values()].filter((item) => item.status === 'accepted')).toHaveLength(5);
+    expect([...db.summaryItems.values()].filter((item) => item.status === 'pending')).toHaveLength(0);
   });
 
-  it('keeps a nameless original sender visible instead of the archive mailbox owner', async () => {
-    const sent: any[] = [];
-    const wrapper = { send: async (value: unknown) => { sent.push(value); return { messageId: 'nameless-copy' }; } } as unknown as SendEmail;
-    const raw = new TextEncoder().encode('From: sender@example.net\r\nSubject: Archivo\r\n\r\nbody');
-    const message = rawIncoming(raw);
-    message.headers.set('from', 'sender@example.net');
-    const cfg = productionArchiveConfig();
-    await deliverIncomingArchive({ ARCHIVE_LINK_KEY: archiveKey, ARCHIVE_EMAIL_COPY: wrapper } as Env, cfg, message);
-    expect(sent[0].from).toEqual({ email: cfg.mailbox.address, name: 'sender@example.net' });
-    expect(sent[0].replyTo.email).toBe('sender@example.net');
-  });
-
-  it('falls back to the original forward after wrapper failure and sends a separate archive notice', async () => {
-    const db = new FakeD1(); const storage = new FakeR2();
-    const events: string[] = []; const nativeCalls: any[] = []; const rejected: string[] = [];
-    const wrapper = { send: async (value: unknown) => {
-      nativeCalls.push(value); events.push((value as any).attachments ? 'decorated-copy' : 'notice');
-      if (nativeCalls.length === 1) throw new Error('native copy rejected');
-      return { messageId: 'native-notice-1' };
-    } } as unknown as SendEmail;
-    const raw = new TextEncoder().encode('From: sender@example.net\r\nSubject: Archivo\r\n\r\nbody');
-    const message = rawIncoming(raw, async () => { events.push('forward'); return undefined; });
-    message.setReject = (reason) => rejected.push(reason);
-
-    await receiveEmail(archiveEnvironment(db, storage, wrapper), productionArchiveConfig(), message);
-    expect(events).toEqual(['decorated-copy', 'forward', 'notice']);
-    expect(nativeCalls).toHaveLength(2);
-    expect(nativeCalls[1].attachments).toBeUndefined();
-    expect(nativeCalls[1].text).toContain('Responder en el webmail:');
-    expect(rejected).toEqual([]);
-    expect(storage.objects.size).toBe(1);
-  });
-
-  it('forwards an oversized original first and then sends only a notice', async () => {
-    const db = new FakeD1(); const storage = new FakeR2();
-    const events: string[] = []; const nativeCalls: any[] = [];
-    const wrapper = { send: async (value: unknown) => { nativeCalls.push(value); events.push('notice'); return { messageId: 'native-notice-2' }; } } as unknown as SendEmail;
-    const raw = new Uint8Array(3 * 1024 * 1024 + 1);
-    const message = rawIncoming(raw, async () => { events.push('forward'); return undefined; });
-
-    await receiveEmail(archiveEnvironment(db, storage, wrapper), productionArchiveConfig(), message);
-    expect(events).toEqual(['forward', 'notice']);
-    expect(nativeCalls).toHaveLength(1);
-    expect(nativeCalls[0].attachments).toBeUndefined();
-    expect(nativeCalls[0].text).toContain('Responder en el webmail:');
-    expect([...storage.objects.values()][0]).toHaveLength(raw.byteLength);
-  });
-
-  it('keeps the accepted original when its optional archive notice fails', async () => {
-    const db = new FakeD1(); const storage = new FakeR2();
-    const rejected: string[] = []; const events: string[] = []; let sends = 0;
-    const wrapper = { send: async () => {
-      sends += 1;
-      if (sends === 1) throw new Error('decorated copy failed');
-      throw new Error('optional notice failed');
-    } } as unknown as SendEmail;
-    const raw = new TextEncoder().encode('From: sender@example.net\r\nSubject: Archivo\r\n\r\nbody');
-    const message = rawIncoming(raw, async () => { events.push('forward accepted'); });
-    message.setReject = (reason) => rejected.push(reason);
-
-    await receiveEmail(archiveEnvironment(db, storage, wrapper), productionArchiveConfig(), message);
-    expect(sends).toBe(2);
-    expect(events).toEqual(['forward accepted']);
-    expect(rejected).toEqual([]);
-    expect(storage.objects.size).toBe(1);
-  });
-
-  it('retains the cached original when both archive delivery paths fail', async () => {
+  it('retains and indexes the cached original when native forwarding fails', async () => {
     const db = new FakeD1(); const storage = new FakeR2();
     const rejected: string[] = []; const raw = new TextEncoder().encode('From: sender@example.net\r\nSubject: Archivo\r\n\r\nbody');
     const wrapper = { send: async () => { throw new Error('native delivery failed'); } } as unknown as SendEmail;
@@ -467,6 +532,71 @@ describe('mail services', () => {
     expect(db.messages).toHaveLength(1);
     expect(db.messages[0].archive_status).toBe('failed');
     expect(bytesOf([...storage.objects.values()][0])).toEqual(bytesOf(raw));
+  });
+
+  it.each([4, 5, 10, 12])('sends only complete summary batches for %i incoming messages', async (count) => {
+    const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
+    const e = summaryEnvironment(db, storage, sent);
+    for (let index = 0; index < count; index += 1) {
+      await receiveEmail(e, summaryConfig(), incoming(`Correo ${index + 1}`).message);
+    }
+    const expectedBatches = Math.floor(count / 5);
+    expect(sent).toHaveLength(expectedBatches);
+    expect([...db.summaryItems.values()].filter((item) => item.status === 'pending')).toHaveLength(count % 5);
+    expect([...db.summaryItems.values()].filter((item) => item.status === 'accepted')).toHaveLength(expectedBatches * 5);
+    expect(db.messages).toHaveLength(count);
+    for (const summary of sent) {
+      expect(summary.to).toBe('archive@example.com');
+      expect(summary.from).toEqual({ email: 'webmail@example.com', name: 'Webmail de Mi Empresa' });
+      expect(summary.subject).toContain('5 correos');
+      expect(summary.text).toContain('Responder en el webmail:');
+      expect(summary.text).toContain('sender@example.net');
+      expect(summary.html).toContain('Responder en el webmail');
+      expect(summary.html).toContain('https://app.example/?reply=');
+      expect((summary.text.match(/Responder en el webmail:/g) ?? [])).toHaveLength(5);
+    }
+    if (expectedBatches > 0) {
+      const token = /Responder en el webmail: https:\/\/app\.example\/\?reply=([A-Za-z0-9_.-]+)/.exec(sent[0].text)?.[1];
+      expect(token).toBeTruthy();
+      const cfg = summaryConfig();
+      storage.objects.clear();
+      db.messages = [];
+      await expect(openArchiveReply(e, cfg, token!)).resolves.toMatchObject({
+        direction: 'incoming',
+        from: 'company-a@example.com',
+        to: ['sender@example.net'],
+      });
+    }
+  });
+
+  it('claims concurrent summary batches once without double-sending items', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
+    const e = summaryEnvironment(db, storage, sent);
+    const messages = Array.from({ length: 10 }, (_, index) => incoming(`Concurrente ${index}`).message);
+    await Promise.all(messages.map((message) => receiveEmail(e, summaryConfig(), message)));
+    expect(sent).toHaveLength(2);
+    expect(db.messages).toHaveLength(10);
+    expect(db.summaryBatches.size).toBe(2);
+    expect([...db.summaryBatches.values()].every((batch) => batch.status === 'accepted')).toBe(true);
+    expect([...db.summaryItems.values()].every((item) => item.status === 'accepted')).toBe(true);
+  });
+
+  it('recovers a claimed-but-unsent batch without resending an ambiguous batch', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
+    const e = summaryEnvironment(db, storage, sent);
+    for (let index = 0; index < 5; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Previo ${index}`).message);
+    expect(sent).toHaveLength(1);
+    const accepted = [...db.summaryBatches.values()][0];
+    accepted.status = 'sending'; accepted.updated_at = '2000-01-01T00:00:00.000Z';
+    for (const item of db.summaryItems.values()) item.status = 'claimed';
+    db.summaryItems.get([...db.summaryItems.keys()][0])!.status = 'unknown';
+    db.summaryItems.get([...db.summaryItems.keys()][0])!.batch_id = accepted.id;
+    await receiveEmail(e, summaryConfig(), incoming('Nuevo lote 1').message);
+    for (let index = 1; index < 5; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Nuevo lote ${index + 1}`).message);
+    expect(sent).toHaveLength(2);
+    // The ambiguous old batch is swept before the next complete batch is sent.
+    expect(db.summaryBatches.get(accepted.id)?.status).toBe('unknown');
+    expect([...db.summaryItems.values()].filter((item) => item.batch_id === accepted.id).every((item) => item.status === 'unknown')).toBe(true);
   });
 
   it('accepts a valid archived reply without a cached original and derives safe thread headers from its token', async () => {
@@ -696,13 +826,15 @@ describe('mail services', () => {
     }));
     try {
       const db = await mf.getD1Database('DB');
-      const migration = await readFile(new URL('../migrations/0001_mail.sql', import.meta.url), 'utf8');
-      const statements = migration
-        .replace(/^[ \t]*--[^\r\n]*(?:\r?\n|$)/gm, '')
-        .split(';')
-        .map((statement) => statement.replace(/\s+/g, ' ').trim())
-        .filter(Boolean);
-      for (const statement of statements) await db.exec(`${statement};`);
+      for (const name of ['0001_mail.sql', '0006_incoming_summary.sql']) {
+        const migration = await readFile(new URL(`../migrations/${name}`, import.meta.url), 'utf8');
+        const statements = migration
+          .replace(/^[ \t]*--[^\r\n]*(?:\r?\n|$)/gm, '')
+          .split(';')
+          .map((statement) => statement.replace(/\s+/g, ' ').trim())
+          .filter(Boolean);
+        for (const statement of statements) await db.exec(`${statement};`);
+      }
       // Miniflare's R2 binding does not accept a Node ReadableStream in all
       // supported versions; D1 and the migration are the integration target
       // here, while this focused fake keeps seed storage deterministic.

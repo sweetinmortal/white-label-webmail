@@ -47,13 +47,4 @@ describe('archive copy content', () => {
     expect(copy.html).not.toContain('<svg onload=');
     expect(copy.html).toContain('&lt;script&gt;subject()&lt;/script&gt;');
   });
-
-  it('marks an attached original in both alternatives', () => {
-    const copy = archiveCopyContent(config(), {
-      direction: 'incoming', token: 'opaque-token', subject: 'Archivo', sender: 'sender@example.net',
-      recipients: ['inbox@example.com'], originalAttached: true,
-    });
-    expect(copy.text).toContain('El original completo está adjunto como original.eml.');
-    expect(copy.html).toContain('El original completo está adjunto como original.eml.');
-  });
 });

@@ -8,6 +8,7 @@ import { cleanup, getCacheUsage, getMessage, getOutgoingAttachment, getRaw, list
 import { seedLocal } from './dev';
 import { checkUsageAlerts, sendUsageAlertTest } from './services/usage-alerts';
 import { archiveReplyContext } from './services/archive-links';
+import { flushIncomingSummaries } from './services/incoming-summary';
 import { handleGoogleAuth, cleanupGoogleAuth } from './google-auth';
 
 async function handle(request: Request, env: Env): Promise<Response> {
@@ -91,6 +92,10 @@ export default {
     if (config.authProvider === 'google') {
       try { await cleanupGoogleAuth(env); }
       catch { console.warn('webmail_auth_cleanup_failed'); }
+    }
+    if (config.incomingSummary?.enabled) {
+      try { console.info('webmail_incoming_summary', await flushIncomingSummaries(env, config)); }
+      catch { console.warn('webmail_incoming_summary_failed'); }
     }
     if (config.cleanupEnabled) {
       try { console.info('webmail_cleanup', await cleanup(env, config)); }

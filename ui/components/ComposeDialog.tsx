@@ -1,7 +1,8 @@
 import { AlertCircle, ArrowLeft, ChevronDown, LoaderCircle, Paperclip, Send, Trash2, X } from 'lucide-react';
-import { useEffect, useRef, useState, type ChangeEvent, type FormEvent } from 'react';
+import { useEffect, useRef, useState, type ChangeEvent, type DragEvent, type FormEvent } from 'react';
 import type { Address, ArchiveReplyContext, MessageDetail, OutgoingAttachment, SendInput, SendResult, SessionInfo } from '../../shared/contracts';
 import { ApiRequestError, apiFetch } from '../lib/api';
+import { attachmentSelectionError, containsDirectory, isFileDrag } from '../lib/attachment-selection';
 import { hasValidEmails, replySubject, splitEmails } from '../lib/format';
 
 const MAX_ATTACHMENTS_FALLBACK = 5;
@@ -81,6 +82,7 @@ export default function ComposeDialog({ session, replyTo, archiveReply, onClose,
   const [text, setText] = useState(() => !archiveReply && replyTo?.bodyText ? `\n\n\n${replyTo.bodyText.split('\n').map((line) => `> ${line}`).join('\n')}` : '');
   const [showCopies, setShowCopies] = useState(Boolean(archiveReply?.cc.length || initialRecipients.cc));
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [dragActive, setDragActive] = useState(false);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<SendResult | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -88,10 +90,17 @@ export default function ComposeDialog({ session, replyTo, archiveReply, onClose,
   const dialogRef = useRef<HTMLDivElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const attachmentsRef = useRef<PendingAttachment[]>([]);
+  const dragDepth = useRef(0);
   const idempotencyKey = useRef<string | null>(null);
   const submitting = useRef(false);
   if (!idempotencyKey.current) idempotencyKey.current = createAttemptKey();
   const dirty = Boolean(to || cc || bcc || subject || text || attachments.length || from !== defaultFrom);
+  const fieldsLocked = busy || submittedInput !== null;
+
+  useEffect(() => {
+    attachmentsRef.current = attachments;
+  }, [attachments]);
 
   useEffect(() => {
     closeButtonRef.current?.focus();
@@ -114,31 +123,108 @@ export default function ComposeDialog({ session, replyTo, archiveReply, onClose,
     return () => document.removeEventListener('keydown', onKeyDown);
   }, [busy, dirty, onClose]);
 
-  const addFiles = (event: ChangeEvent<HTMLInputElement>) => {
+  const addFiles = (selected: File[]) => {
+    if (!selected.length || fieldsLocked) return;
+    setError(null);
+    const current = attachmentsRef.current;
+    const currentBytes = current.reduce((total, attachment) => total + attachment.sizeBytes, 0);
+    const validationError = attachmentSelectionError(
+      selected,
+      current.length,
+      currentBytes,
+      maxAttachments,
+      maxAttachmentBytes,
+      formatSize,
+    );
+    if (validationError) {
+      setError(validationError);
+      return;
+    }
+    const next = [...current, ...selected.map((file) => ({ id: createAttemptKey(), file, mimeType: file.type || 'application/octet-stream', sizeBytes: file.size }))];
+    attachmentsRef.current = next;
+    setAttachments(next);
+  };
+
+  const addFilesFromPicker = (event: ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(event.target.files ?? []);
     event.target.value = '';
-    if (!selected.length) return;
-    setError(null);
-    const available = maxAttachments - attachments.length;
-    if (selected.length > available) {
-      setError(`Puedes adjuntar como máximo ${maxAttachments} archivos.`);
-      return;
-    }
-    const currentTotal = attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0);
-    const incomingTotal = selected.reduce((total, file) => total + file.size, 0);
-    if (currentTotal + incomingTotal > maxAttachmentBytes) {
-      setError(`Los adjuntos superan el límite de ${formatSize(maxAttachmentBytes)} en total.`);
-      return;
-    }
-    if (selected.some((file) => file.size === 0)) {
-      setError('Uno de los archivos está vacío.');
-      return;
-    }
-    setAttachments((current) => [...current, ...selected.map((file) => ({ id: createAttemptKey(), file, mimeType: file.type || 'application/octet-stream', sizeBytes: file.size }))]);
+    addFiles(selected);
   };
 
   const removeAttachment = (id: string) => {
     setAttachments((current) => current.filter((attachment) => attachment.id !== id));
+  };
+
+  useEffect(() => {
+    const resetDrag = () => {
+      dragDepth.current = 0;
+      setDragActive(false);
+    };
+    const onWindowDragOver = (event: globalThis.DragEvent) => {
+      if (isFileDrag(event.dataTransfer?.types)) event.preventDefault();
+    };
+    const onWindowDrop = (event: globalThis.DragEvent) => {
+      if (!isFileDrag(event.dataTransfer?.types)) return;
+      // Never let a file drop navigate the browser away from the webmail.
+      event.preventDefault();
+      resetDrag();
+      if (dialogRef.current?.contains(event.target as Node) || fieldsLocked) return;
+      setError('Suelta los archivos sobre la redacción para adjuntarlos.');
+    };
+    const onWindowDragLeave = (event: globalThis.DragEvent) => {
+      // Some browsers expose an empty types list on dragleave. If the pointer
+      // leaves the window entirely, reset regardless of the advertised type.
+      if (!event.relatedTarget) resetDrag();
+    };
+    window.addEventListener('dragover', onWindowDragOver);
+    window.addEventListener('drop', onWindowDrop);
+    window.addEventListener('dragleave', onWindowDragLeave);
+    window.addEventListener('dragend', resetDrag);
+    return () => {
+      window.removeEventListener('dragover', onWindowDragOver);
+      window.removeEventListener('drop', onWindowDrop);
+      window.removeEventListener('dragleave', onWindowDragLeave);
+      window.removeEventListener('dragend', resetDrag);
+    };
+  }, [fieldsLocked]);
+
+  const onDragEnter = (event: DragEvent<HTMLDivElement>) => {
+    if (!isFileDrag(event.dataTransfer?.types)) return;
+    event.preventDefault();
+    if (fieldsLocked) return;
+    dragDepth.current += 1;
+    setDragActive(true);
+  };
+
+  const onDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!isFileDrag(event.dataTransfer?.types)) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = fieldsLocked ? 'none' : 'copy';
+  };
+
+  const onDragLeave = () => {
+    // Leave events are unreliable about types, so pair every enter event with
+    // a decrement while the overlay is active. Text drags never increment.
+    if (dragDepth.current === 0) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragActive(false);
+  };
+
+  const onDrop = (event: DragEvent<HTMLDivElement>) => {
+    if (!isFileDrag(event.dataTransfer?.types)) return;
+    event.preventDefault();
+    event.stopPropagation();
+    dragDepth.current = 0;
+    setDragActive(false);
+    if (fieldsLocked) {
+      setError('Espera a que termine el envío antes de añadir adjuntos.');
+      return;
+    }
+    if (containsDirectory(event.dataTransfer.items)) {
+      setError('No se pueden adjuntar carpetas. Selecciona uno o varios archivos.');
+      return;
+    }
+    addFiles(Array.from(event.dataTransfer.files ?? []));
   };
 
   const submit = async (event: FormEvent) => {
@@ -198,11 +284,11 @@ export default function ComposeDialog({ session, replyTo, archiveReply, onClose,
   };
 
   const close = () => { if (!busy && (!dirty || window.confirm('¿Descartar este borrador?'))) onClose(); };
-  const fieldsLocked = busy || submittedInput !== null;
   const canCheckStatus = !result || ['unknown', 'pending', 'sending'].includes(result.status);
   const actionLabel = submittedInput ? 'Consultar estado' : 'Enviar mensaje';
   const attachmentTotal = attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0);
-  return <div className="compose-backdrop" role="presentation"><div className="compose-dialog" role="dialog" aria-modal="true" aria-labelledby="compose-title" ref={dialogRef}>
+  return <div className="compose-backdrop" role="presentation"><div className="compose-dialog" role="dialog" aria-modal="true" aria-labelledby="compose-title" ref={dialogRef} onDragEnter={onDragEnter} onDragOver={onDragOver} onDragLeave={onDragLeave} onDrop={onDrop}>
+    {dragActive && !fieldsLocked && <div className="compose-dropzone" role="status" aria-live="polite"><Paperclip size={30} /><strong>Suelta los archivos para adjuntarlos</strong><span>Se añadirán a este mensaje y no se enviará automáticamente.</span></div>}
     <header className="compose-header"><button type="button" className="icon-button" aria-label="Cerrar redacción" onClick={close} ref={closeButtonRef}><ArrowLeft size={27} /></button><h1 id="compose-title">Nuevo mensaje</h1><button type="button" className="icon-button" aria-label="Descartar redacción" onClick={close}><X size={28} /></button></header>
     <form className="compose-form" onSubmit={submit}>
       <div className="compose-field compose-from"><label htmlFor="compose-from">De</label><select id="compose-from" value={from} onChange={(event) => setFrom(event.target.value)} disabled={fieldsLocked || busy}>{identities.some((identity) => normalizeEmail(identity.email) === normalizeEmail(session.mailbox.address)) ? null : <option value={session.mailbox.address}>{session.mailbox.name} &lt;{session.mailbox.address}&gt;</option>}{identities.map((identity) => <option key={identity.email} value={identity.email}>{identity.name ? `${identity.name} <${identity.email}>` : identity.email}</option>)}</select></div>
@@ -211,8 +297,9 @@ export default function ComposeDialog({ session, replyTo, archiveReply, onClose,
       <div className="compose-field"><label htmlFor="compose-subject">Asunto</label><input id="compose-subject" value={subject} onChange={(event) => setSubject(event.target.value)} placeholder="Asunto" disabled={fieldsLocked} /></div>
       <label className="sr-only" htmlFor="compose-body">Mensaje</label><textarea id="compose-body" className="compose-body" value={text} onChange={(event) => setText(event.target.value)} placeholder="Escribe tu mensaje" disabled={fieldsLocked} />
       <div className="compose-attachments">
-        <input ref={fileInputRef} id="compose-files" type="file" multiple hidden onChange={addFiles} disabled={fieldsLocked} />
+        <input ref={fileInputRef} id="compose-files" type="file" multiple hidden onChange={addFilesFromPicker} disabled={fieldsLocked} />
         <div className="compose-attachments-head"><button type="button" className="button button-secondary" onClick={() => fileInputRef.current?.click()} disabled={fieldsLocked || attachments.length >= maxAttachments}><Paperclip size={17} />Adjuntar archivos</button><span>{attachments.length}/{maxAttachments} · {formatSize(attachmentTotal)} de {formatSize(maxAttachmentBytes)}</span></div>
+        <p className="compose-drop-hint">También puedes arrastrar archivos desde el explorador hasta esta redacción.</p>
         {attachments.length > 0 && <ul className="compose-file-list">{attachments.map((attachment) => <li key={attachment.id}><Paperclip size={15} /><span>{attachment.file.name}</span><small>{formatSize(attachment.sizeBytes)}</small><button type="button" className="icon-button" aria-label={`Quitar ${attachment.file.name}`} onClick={() => removeAttachment(attachment.id)} disabled={fieldsLocked}><Trash2 size={16} /></button></li>)}</ul>}
       </div>
       <div className="compose-footer"><p>Se guardará una copia en tu correo principal.</p>{session.mode === 'local' && <span className="local-copy">Vista local · Los envíos son de prueba</span>}<div className="compose-actions"><button type="button" className="button button-secondary" onClick={close} disabled={busy}>Descartar</button><button type="submit" className="button button-primary" disabled={busy || !canCheckStatus}>{busy ? <><LoaderCircle className="spin" size={19} /> Enviando…</> : submittedInput ? actionLabel : <><Send size={19} />{actionLabel}</>}</button></div></div>

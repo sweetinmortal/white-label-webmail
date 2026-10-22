@@ -23,6 +23,15 @@
     "enabled": true,
     "maxDecoratedBytes": 3145728
   },
+  "incomingSummary": {
+    "enabled": false,
+    "batchSize": 5,
+    "from": {
+      "name": "Webmail de Mi Empresa",
+      "email": "webmail@empresa.example"
+    },
+    "timeZone": "UTC"
+  },
   "usageAlerts": {
     "enabled": false,
     "thresholdPercent": 95,

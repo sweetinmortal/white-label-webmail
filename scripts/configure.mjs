@@ -20,6 +20,11 @@ if (!['r2', 'turso'].includes(storageProvider)) throw new Error('storageProvider
 const usageAlertDelivery = company.usageAlerts?.delivery ?? 'mailjet';
 const archiveCopiesEnabled = company.archiveCopies?.enabled !== false;
 if (!['mailjet', 'cloudflare'].includes(usageAlertDelivery)) throw new Error('usageAlerts.delivery debe ser mailjet o cloudflare.');
+if (company.incomingSummary?.enabled && (typeof company.incomingSummary.from?.email !== 'string' || !company.incomingSummary.from.email)) {
+  throw new Error('incomingSummary.from.email es obligatorio cuando el resumen está activo.');
+}
+const summarySender = company.incomingSummary?.enabled ? company.incomingSummary.from.email : undefined;
+const allowedArchiveSenders = [...new Set([company.mailbox.address, ...(summarySender ? [summarySender] : [])])];
 const companyJson = JSON.stringify(company);
 const productionPath = path.join(root, 'wrangler.production.jsonc');
 
@@ -127,8 +132,12 @@ if (company.usageAlerts?.enabled && usageAlertDelivery === 'cloudflare') {
     allowed_sender_addresses: [company.mailbox.address],
   }];
 }
-if (archiveCopiesEnabled) {
-  (production.send_email ??= []).push({ name: 'ARCHIVE_EMAIL_COPY', destination_address: company.archiveAddress, allowed_sender_addresses: [company.mailbox.address] });
+if (archiveCopiesEnabled || summarySender) {
+  (production.send_email ??= []).push({
+    name: 'ARCHIVE_EMAIL_COPY',
+    destination_address: company.archiveAddress,
+    allowed_sender_addresses: allowedArchiveSenders,
+  });
 }
 await writeFile(productionPath, JSON.stringify(production, null, 2) + '\n');
 console.log('Configuración local y de producción generadas. No se ha creado ni desplegado ningún recurso.');

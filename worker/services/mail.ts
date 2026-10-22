@@ -2,20 +2,20 @@ import type { D1Database } from '@cloudflare/workers-types';
 import { addressParser, decodeWords } from 'postal-mime';
 import type { Address, AttachmentInfo, Folder, MessageDetail, MessagePage, MessageSummary, OutgoingAttachment, SendInput, SendResult, SendStatus, ArchiveStatus } from '../../shared/contracts';
 import { base64ByteLength, isMimeType, normalizeBase64, sanitizeAttachmentFilename } from '../../shared/attachments';
-import { parseEmailContent } from '../../shared/email-content';
 import { AppError } from '../errors';
 import { mailIdentities } from '../config';
 import type { Env, Identity, IncomingEmail, MailConfig } from '../types';
 import { localProvider } from '../providers/local';
 import { mailjetProvider } from '../providers/mailjet';
 import type { OutboundMessage, OutboundProvider, OutboundRecipient, ProviderResult } from '../providers/types';
-import { addDaysIso, ensureSchema, json, nowIso, parseJson } from '../store/schema';
+import { addDaysIso, ensureSchema, isUniqueConstraint, json, nowIso, parseJson } from '../store/schema';
 import { deleteObject, getObject, getStorageUsage, pauseStorage, putJson, putStream, releaseStorage, reserveStorage } from '../store/storage';
 import { releaseRecipients, reserveRecipients } from '../store/quota';
 import { addTombstone, claimOutbox, findIdempotency, insertOutbox, setOutboxStatus, updateRecipientResults } from '../store/outbox';
 import { getMailStore } from '../store/objects';
 import { archiveMessageId, archiveReferences, assertArchiveLinkKey, openArchiveReply, sealArchiveReply } from './archive-links';
-import { archiveCopyContent, readArchiveOriginal } from './archive-copy';
+import { cleanupSummaryState, enqueueSummaryItem } from '../store/incoming-summary';
+import { flushIncomingSummaries } from './incoming-summary';
 
 const MAX_CURSOR_BYTES = 512;
 const MAX_PAGE = 30;
@@ -94,9 +94,25 @@ function validateConfig(config: MailConfig): void {
   if ((config.mode === 'local') !== (config.provider === 'local')) {
     throw new AppError(500, 'provider_mode_mismatch', 'El proveedor no coincide con el modo del buzón.');
   }
+  if (config.incomingSummary) {
+    const summary = config.incomingSummary;
+    if (!Number.isSafeInteger(summary.batchSize) || summary.batchSize < 1 || summary.batchSize > 50) {
+      throw new AppError(500, 'summary_misconfigured', 'El tamaño del resumen no está configurado correctamente.');
+    }
+    if (summary.enabled && (!summary.from || !EMAIL_RE.test(normalizeEmail(summary.from.email)))) {
+      throw new AppError(500, 'summary_misconfigured', 'El remitente del resumen no está configurado correctamente.');
+    }
+  }
 }
 
 function id(): string { return crypto.randomUUID(); }
+
+async function incomingDedupeKey(recipient: string, rfcMessageId: string | undefined): Promise<string | undefined> {
+  if (!rfcMessageId) return undefined;
+  const bytes = new TextEncoder().encode(`${recipient}\n${rfcMessageId}`);
+  const digest = await crypto.subtle.digest('SHA-256', bytes);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
 
 function decodeHeaderValue(value: string, max = MAX_DECODED_HEADER): string {
   const bounded = value.replace(/[\r\n]/g, ' ').trim().slice(0, max);
@@ -620,76 +636,17 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
   return { id: messageId, status: providerResultStatus(result), reused: false };
 }
 
-export async function deliverIncomingArchive(env: Env, config: MailConfig, message: IncomingEmail): Promise<{ archived: boolean; cacheRaw: ReadableStream<Uint8Array> }> {
-  let cacheRaw = message.raw;
-  if (!config.archiveCopies?.enabled) {
-    let archived = false;
-    try { await message.forward(config.archiveAddress); archived = true; } catch { /* the cache may still retain the original */ }
-    return { archived, cacheRaw };
+export async function forwardIncomingOriginal(_env: Env, config: MailConfig, message: IncomingEmail): Promise<{ forwarded: boolean; cacheRaw: ReadableStream<Uint8Array> }> {
+  let forwarded = false;
+  try {
+    // Native forwarding replays the untouched RFC message: real sender,
+    // headers, body and attachments. No notice or archive caratula is created.
+    await message.forward(config.archiveAddress);
+    forwarded = true;
+  } catch {
+    // The temporary cache may still retain the original when Gmail rejects it.
   }
-  let token: string | undefined;
-  const subject = parseHeader(message.headers, 'subject', 998) || '';
-  const headerSender = parseAddress(parseHeader(message.headers, 'from', MAX_ADDRESS_HEADER) || message.from);
-  const senderLabel = headerSender.name || headerSender.email || config.mailbox.name;
-  const replyAddress = parseAddress(parseHeader(message.headers, 'reply-to') || headerSender.email);
-  const parentId = archiveMessageId(parseHeader(message.headers, 'message-id', 998));
-  const references = archiveReferences(referencesFrom(parseHeader(message.headers, 'references', 8192)));
-  if (config.archiveCopies?.enabled) {
-    try {
-      token = await sealArchiveReply(env, config, {
-        direction: 'incoming', from: normalizeEmail(message.to), to: EMAIL_RE.test(replyAddress.email) && replyAddress.email.length <= 254 ? [replyAddress.email] : [],
-        cc: [], subject: subject.slice(0, 251), inReplyTo: parentId, references,
-      });
-    } catch { console.warn('webmail_archive_link_unavailable'); }
-  }
-  const size = Number(message.rawSize);
-  const bounded = config.archiveCopies?.incomingMode !== 'forward-with-notice' && Number.isSafeInteger(size) && size > 0 && size <= config.archiveCopies.maxDecoratedBytes;
-  if (token && env.ARCHIVE_EMAIL_COPY && bounded) {
-    const [archiveRaw, storageRaw] = cacheRaw.tee();
-    cacheRaw = storageRaw;
-    try {
-      const original = await readArchiveOriginal(archiveRaw, size, config.archiveCopies!.maxDecoratedBytes);
-      const parsed = await parseEmailContent(original.buffer.slice(original.byteOffset, original.byteOffset + original.byteLength) as ArrayBuffer);
-      const copyAttachments: EmailAttachment[] = [];
-      for (const attachment of parsed.attachments.slice(0, 30)) {
-        if (attachment.inline && attachment.contentId) {
-          copyAttachments.push({ filename: attachment.filename, type: attachment.mimeType, content: attachment.content, disposition: 'inline', contentId: attachment.contentId });
-        } else {
-          copyAttachments.push({ filename: attachment.filename, type: attachment.mimeType, content: attachment.content, disposition: 'attachment' });
-        }
-      }
-      copyAttachments.push({ filename: 'original.eml', type: 'message/rfc822', content: original, disposition: 'attachment' });
-      if (copyAttachments.length > 32) throw new Error('archive_attachment_limit');
-      const copy = archiveCopyContent(config, {
-        direction: 'incoming', token, subject, sender: headerSender.email, senderName: headerSender.name,
-        recipients: [message.to], text: parsed.bodyText, html: parsed.html, htmlStyles: parsed.styles, originalAttached: true,
-      });
-      const accepted = await env.ARCHIVE_EMAIL_COPY.send({
-        from: { email: config.mailbox.address, name: senderLabel }, to: config.archiveAddress,
-        subject: subject.slice(0, 255) || 'Correo recibido', text: copy.text, html: copy.html,
-        ...(EMAIL_RE.test(replyAddress.email) && replyAddress.email.length <= 254 ? { replyTo: { email: replyAddress.email, name: replyAddress.name || senderLabel } } : {}),
-        attachments: copyAttachments,
-      });
-      if (!accepted.messageId) throw new Error('archive_acceptance_unknown');
-      return { archived: true, cacheRaw };
-    } catch { console.warn('webmail_archive_copy_fallback'); }
-  }
-  // Large originals and failures keep the unrestricted original forwarding path.
-  // All archive work occurs before D1/Turso. A failed optional notice never rejects
-  // an original already accepted by the durable destination.
-  let archived = false;
-  try { await message.forward(config.archiveAddress); archived = true; } catch { /* the cache may still retain the original */ }
-  if (archived && token && env.ARCHIVE_EMAIL_COPY) {
-    try {
-      const copy = archiveCopyContent(config, {
-        direction: 'incoming', token, subject, sender: headerSender.email, senderName: headerSender.name,
-        recipients: [message.to], notice: true,
-      });
-      await env.ARCHIVE_EMAIL_COPY.send({ from: { email: config.mailbox.address, name: senderLabel }, to: config.archiveAddress,
-        subject: subject.slice(0, 255) || 'Correo recibido', text: copy.text, html: copy.html });
-    } catch { console.warn('webmail_archive_notice_failed'); }
-  }
-  return { archived, cacheRaw };
+  return { forwarded, cacheRaw: message.raw };
 }
 
 export async function receiveEmail(env: Env, config: MailConfig, message: IncomingEmail): Promise<void> {
@@ -699,16 +656,34 @@ export async function receiveEmail(env: Env, config: MailConfig, message: Incomi
     message.setReject('La dirección de destino no está configurada.');
     return;
   }
-  // Archive delivery never depends on database availability or cache capacity.
-  const { archived: forwarded, cacheRaw } = await deliverIncomingArchive(env, config, message);
+  const headers = message.headers;
+  const subject = parseHeader(headers, 'subject', 998) || '';
+  const rfcMessageId = parseHeader(headers, 'message-id', 998);
+  const incomingKey = await incomingDedupeKey(recipient, rfcMessageId).catch(() => undefined);
+
+  // Dedupe before forwarding when D1 is available. A retried delivery with the
+  // same Message-ID and envelope recipient must not create another original or
+  // another summary slot. D1 failures fall through to native forwarding.
   let schemaReady = true;
   try { await ensureSchema(env.DB); } catch { schemaReady = false; }
+  if (schemaReady && incomingKey) {
+    try {
+      const duplicate = await env.DB.prepare(`SELECT id FROM mail_messages WHERE mailbox_id = ? AND incoming_key = ? LIMIT 1`).bind(config.mailbox.id, incomingKey).first<{ id: string }>();
+      if (duplicate) return;
+    } catch { /* Keep the original path independent from index availability. */ }
+  }
+
+  // Archive delivery never depends on database availability or cache capacity.
+  const { forwarded, cacheRaw } = await forwardIncomingOriginal(env, config, message);
   const receiptId = id();
   const receivedAt = nowIso();
   const size = Number(message.rawSize);
   if (!Number.isSafeInteger(size) || size < 0 || size > config.maxMessageBytes) {
     if (!forwarded) message.setReject('El mensaje excede el límite o no se pudo conservar.');
     return;
+  }
+  if (!schemaReady) {
+    try { await ensureSchema(env.DB); schemaReady = true; } catch { schemaReady = false; }
   }
   if (!schemaReady) {
     if (!forwarded) message.setReject('No se pudo entregar ni conservar el mensaje.');
@@ -740,7 +715,6 @@ export async function receiveEmail(env: Env, config: MailConfig, message: Incomi
     if (!forwarded) message.setReject('No se pudo entregar ni conservar el mensaje.');
     return;
   }
-  const headers = message.headers;
   const envelopeFrom = parseAddress(message.from || 'unknown@example.invalid');
   const headerFrom = parseHeader(headers, 'from', MAX_ADDRESS_HEADER);
   const parsedHeaderFrom = headerFrom ? parseAddress(headerFrom) : undefined;
@@ -749,18 +723,46 @@ export async function receiveEmail(env: Env, config: MailConfig, message: Incomi
   const cc = parseAddressList(parseHeader(headers, 'cc')).slice(0, 50);
   const replyToHeader = parseAddress(parseHeader(headers, 'reply-to') || '');
   const hasReplyTo = EMAIL_RE.test(replyToHeader.email);
-  const subject = parseHeader(headers, 'subject', 998) || '';
-  const rfcMessageId = parseHeader(headers, 'message-id', 998);
   const references = referencesFrom(parseHeader(headers, 'references', 8192));
   const expiresAt = addDaysIso(config.retentionDays, Date.parse(receivedAt));
   const messageId = id();
   try {
-    const insert = env.DB.prepare(`INSERT INTO mail_messages (id, mailbox_id, direction, from_email, from_name, to_json, cc_json, subject, reply_to_json, rfc_message_id, references_json, raw_key, size_bytes, created_at, received_at, expires_at, receipt_id, archive_address, archive_status) VALUES (?, ?, 'incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(messageId, config.mailbox.id, from.email, from.name ?? '', json(to), json(cc), subject, hasReplyTo ? json(replyToHeader) : null, rfcMessageId ?? null, json(references), rawKey, size, receivedAt, receivedAt, expiresAt, receiptId, config.archiveAddress, forwarded ? 'forward_accepted' : 'failed');
+    const insert = env.DB.prepare(`INSERT INTO mail_messages (id, mailbox_id, direction, from_email, from_name, to_json, cc_json, subject, reply_to_json, rfc_message_id, references_json, raw_key, size_bytes, created_at, received_at, expires_at, receipt_id, archive_address, archive_status, incoming_key) VALUES (?, ?, 'incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .bind(messageId, config.mailbox.id, from.email, from.name ?? '', json(to), json(cc), subject, hasReplyTo ? json(replyToHeader) : null, rfcMessageId ?? null, json(references), rawKey, size, receivedAt, receivedAt, expiresAt, receiptId, config.archiveAddress, forwarded ? 'forward_accepted' : 'failed', incomingKey ?? null);
     await env.DB.batch([insert, env.DB.prepare('INSERT INTO mail_message_identities (message_id, address) VALUES (?, ?)').bind(messageId, recipient)]);
-  } catch {
-    // Keep the private object: it may be the only retained copy when indexing fails.
+  } catch (error) {
+    if (isUniqueConstraint(error)) {
+      // A concurrent duplicate won the unique incoming key. Remove this
+      // object and release its reservation; no summary slot is consumed.
+      try { await deleteObject(getMailStore(env, config), rawKey); } catch { /* best effort */ }
+      try { await releaseStorage(env.DB, config.mailbox.id, size); } catch { /* best effort */ }
+    }
+    // Keep the private object on other index failures: it may be the only
+    // retained copy when indexing fails.
     return;
+  }
+  if (config.incomingSummary?.enabled) {
+    try {
+      const replyAddress = parseAddress(parseHeader(headers, 'reply-to') || headerFrom || from.email);
+      const replyTo = EMAIL_RE.test(replyAddress.email) && replyAddress.email.length <= 254 ? [normalizeEmail(replyAddress.email)] : [];
+      const parentId = archiveMessageId(rfcMessageId);
+      await enqueueSummaryItem(env.DB, {
+        messageId,
+        mailboxId: config.mailbox.id,
+        senderEmail: from.email,
+        senderName: from.name ?? '',
+        subject,
+        recipientAddress: recipient,
+        receivedAt,
+        replyFrom: recipient,
+        replyTo,
+        ...(parentId ? { inReplyTo: parentId } : {}),
+        references: archiveReferences(references),
+      });
+      // A summary failure is intentionally isolated from both the original
+      // forwarding and the temporary inbox copy.
+      await flushIncomingSummaries(env, config);
+    } catch { console.warn('webmail_incoming_summary_failed'); }
   }
 }
 
@@ -861,6 +863,8 @@ export async function cleanup(env: Env, config: MailConfig): Promise<{ deleted: 
   const heldRow = await env.DB.prepare(`SELECT COUNT(*) AS count FROM mail_messages WHERE mailbox_id = ? AND delete_state IN ('active','deleting') AND expires_at <= ? AND (archive_status IN ('pending','failed','unknown') OR send_status IN ('pending','sending','unknown'))`).bind(config.mailbox.id, now).first<{ count: number }>();
   await env.DB.prepare(`DELETE FROM mail_idempotency_tombstones WHERE expires_at <= ?`).bind(now).run();
   await env.DB.prepare(`DELETE FROM mail_webhook_events WHERE received_at <= ?`).bind(addDaysIso(-Math.max(30, config.retentionDays + 30))).run();
+  try { await cleanupSummaryState(env.DB, config.retentionDays); }
+  catch { console.warn('webmail_summary_cleanup_failed'); }
   return { deleted, held: Number(heldRow?.count ?? 0) };
 }
 

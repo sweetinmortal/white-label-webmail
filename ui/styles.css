@@ -177,7 +177,10 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .toast button { display: inline-grid; place-items: center; border: 0; color: var(--muted); background: transparent; }
 
 .compose-backdrop { position: fixed; z-index: 20; inset: 0; display: grid; place-items: center; padding: 30px; background: rgb(21 34 49 / 22%); }
-.compose-dialog { width: min(900px, 100%); max-height: min(900px, calc(100svh - 60px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); background: var(--white); box-shadow: var(--shadow); }
+.compose-dialog { position: relative; width: min(900px, 100%); max-height: min(900px, calc(100svh - 60px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid var(--line); background: var(--white); box-shadow: var(--shadow); }
+.compose-dropzone { position: absolute; z-index: 4; inset: 10px; display: grid; place-content: center; justify-items: center; gap: 9px; border: 2px dashed var(--blue); border-radius: 10px; color: var(--blue); background: color-mix(in srgb, var(--blue) 8%, rgb(255 255 255 / 96%)); text-align: center; pointer-events: none; }
+.compose-dropzone strong { color: var(--ink); font-size: 18px; }
+.compose-dropzone span { max-width: 330px; color: var(--muted); font-size: 14px; line-height: 1.45; }
 .compose-header { flex: 0 0 auto; display: flex; align-items: center; gap: 20px; min-height: 82px; padding: 14px 28px; border-bottom: 1px solid var(--line); }
 .compose-header h1 { flex: 1; margin: 0; color: #10213a; font-size: 29px; letter-spacing: -.03em; }
 .compose-form { min-height: 0; flex: 1; display: flex; flex-direction: column; overflow: auto; }
@@ -193,6 +196,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .compose-attachments { padding: 14px 42px 4px; border-top: 1px solid var(--line); }
 .compose-attachments-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
 .compose-attachments-head span { color: var(--muted); font-size: 13px; }
+.compose-drop-hint { margin: 9px 0 0; color: var(--muted); font-size: 12px; line-height: 1.4; }
 .compose-file-list { margin: 12px 0 4px; padding: 0; list-style: none; display: grid; gap: 7px; }
 .compose-file-list li { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid var(--line-light); border-radius: 7px; font-size: 14px; }
 .compose-file-list li span { min-width: 0; flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }

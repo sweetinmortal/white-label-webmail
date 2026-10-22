@@ -77,11 +77,32 @@ export function loadConfig(env: Env): MailConfig {
   if (raw.archiveCopies !== undefined && (!raw.archiveCopies || Array.isArray(raw.archiveCopies) || typeof raw.archiveCopies.enabled !== 'boolean')) {
     throw new AppError(503, 'CONFIG_INVALID', 'Las copias del archivo no están configuradas correctamente.');
   }
-  if (raw.archiveCopies?.incomingMode !== undefined && !['attachment', 'forward-with-notice'].includes(raw.archiveCopies.incomingMode)) {
-    throw new AppError(503, 'CONFIG_INVALID', 'La presentación del archivo no es válida.');
+  const brandName = string(raw.brand?.name, 'Correo');
+  let incomingSummary: MailConfig['incomingSummary'];
+  if (raw.incomingSummary !== undefined) {
+    const summary = raw.incomingSummary;
+    if (!summary || Array.isArray(summary) || typeof summary !== 'object' || typeof summary.enabled !== 'boolean' ||
+        (summary.from !== undefined && (!summary.from || Array.isArray(summary.from) || typeof summary.from !== 'object'))) {
+      throw new AppError(503, 'CONFIG_INVALID', 'El resumen de entrantes no está configurado correctamente.');
+    }
+    const from = summary.from === undefined ? undefined : {
+      email: normalizeEmail(summary.from.email),
+      name: string(summary.from.name, `${brandName} Webmail`),
+    };
+    if (summary.enabled && !from) throw new AppError(503, 'CONFIG_INVALID', 'Falta el remitente del resumen de entrantes.');
+    if (from?.email === archiveAddress) throw new AppError(503, 'CONFIG_INVALID', 'El remitente del resumen no puede ser el archivo principal.');
+    const timeZone = string(summary.timeZone, 'UTC', 64);
+    try { new Intl.DateTimeFormat('en', { timeZone }).format(new Date()); }
+    catch { throw new AppError(503, 'CONFIG_INVALID', 'La zona horaria del resumen no es válida.'); }
+    incomingSummary = {
+      enabled: summary.enabled,
+      batchSize: integer(summary.batchSize, 5, 1, 50),
+      ...(from ? { from } : {}),
+      timeZone,
+    };
   }
   return {
-    brand: { name: string(raw.brand?.name, 'Correo'), logo, primaryColor: color, locale: string(raw.brand?.locale, 'es', 30) },
+    brand: { name: brandName, logo, primaryColor: color, locale: string(raw.brand?.locale, 'es', 30) },
     appOrigin,
     mailbox: { id: mailboxId, address: mailboxAddress, name: mailboxName },
     identities,
@@ -100,8 +121,8 @@ export function loadConfig(env: Env): MailConfig {
     archiveCopies: {
       enabled: raw.archiveCopies?.enabled !== false,
       maxDecoratedBytes: integer(raw.archiveCopies?.maxDecoratedBytes, 3145728, 1024, 3145728),
-      incomingMode: raw.archiveCopies?.incomingMode ?? 'attachment',
     },
+    ...(incomingSummary ? { incomingSummary } : {}),
     ...(raw.usageAlerts ? { usageAlerts: {
       enabled: !local && raw.usageAlerts.enabled,
       thresholdPercent: integer(raw.usageAlerts.thresholdPercent, 95, 1, 99),

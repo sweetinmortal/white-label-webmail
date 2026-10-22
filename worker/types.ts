@@ -46,7 +46,8 @@ export interface MailConfig {
   provider: 'local' | 'mailjet';
   storageProvider?: 'r2' | 'turso';
   usageAlerts?: { enabled: boolean; thresholdPercent: number; zeroTrustSeatLimit: number; delivery?: 'mailjet' | 'cloudflare' };
-  archiveCopies?: { enabled: boolean; maxDecoratedBytes: number; incomingMode?: 'attachment' | 'forward-with-notice' };
+  archiveCopies?: { enabled: boolean; maxDecoratedBytes: number };
+  incomingSummary?: { enabled: boolean; batchSize: number; from?: Address; timeZone: string };
   accessTeamDomain: string;
   accessAudience: string;
   authProvider?: 'access' | 'google';

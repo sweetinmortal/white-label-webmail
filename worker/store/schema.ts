@@ -1,8 +1,9 @@
 import type { D1Database } from '@cloudflare/workers-types';
 
 const statements = [
-  `CREATE TABLE IF NOT EXISTS mail_messages (id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, direction TEXT NOT NULL, from_email TEXT NOT NULL, from_name TEXT NOT NULL DEFAULT '', to_json TEXT NOT NULL, cc_json TEXT NOT NULL DEFAULT '[]', subject TEXT NOT NULL DEFAULT '', reply_to_json TEXT, rfc_message_id TEXT, references_json TEXT NOT NULL DEFAULT '[]', body_text TEXT, raw_key TEXT, payload_key TEXT, size_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, received_at TEXT, sent_at TEXT, expires_at TEXT NOT NULL, receipt_id TEXT UNIQUE, archive_address TEXT, archive_status TEXT NOT NULL DEFAULT 'pending', send_status TEXT, delete_state TEXT NOT NULL DEFAULT 'active', delete_started_at TEXT)`,
+  `CREATE TABLE IF NOT EXISTS mail_messages (id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, direction TEXT NOT NULL, from_email TEXT NOT NULL, from_name TEXT NOT NULL DEFAULT '', to_json TEXT NOT NULL, cc_json TEXT NOT NULL DEFAULT '[]', subject TEXT NOT NULL DEFAULT '', reply_to_json TEXT, rfc_message_id TEXT, references_json TEXT NOT NULL DEFAULT '[]', body_text TEXT, raw_key TEXT, payload_key TEXT, size_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, received_at TEXT, sent_at TEXT, expires_at TEXT NOT NULL, receipt_id TEXT UNIQUE, archive_address TEXT, archive_status TEXT NOT NULL DEFAULT 'pending', send_status TEXT, delete_state TEXT NOT NULL DEFAULT 'active', delete_started_at TEXT, incoming_key TEXT)`,
   `CREATE INDEX IF NOT EXISTS mail_messages_folder_cursor ON mail_messages (mailbox_id, direction, created_at DESC, id DESC)`,
+  `CREATE UNIQUE INDEX IF NOT EXISTS mail_messages_incoming_key ON mail_messages (mailbox_id, incoming_key)`,
   `CREATE INDEX IF NOT EXISTS mail_messages_expiry ON mail_messages (expires_at, delete_state, id)`,
   `CREATE INDEX IF NOT EXISTS mail_messages_receipt ON mail_messages (receipt_id)`,
   `CREATE INDEX IF NOT EXISTS mail_messages_archive_status ON mail_messages (archive_status, expires_at)`,
@@ -30,6 +31,12 @@ const statements = [
   `CREATE TABLE IF NOT EXISTS mail_message_identities (message_id TEXT PRIMARY KEY, address TEXT NOT NULL, FOREIGN KEY (message_id) REFERENCES mail_messages(id) ON DELETE CASCADE)`,
   `CREATE INDEX IF NOT EXISTS mail_message_identity_address ON mail_message_identities (address, message_id)`,
   `INSERT OR IGNORE INTO mail_schema_migrations (version, applied_at) VALUES (3, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+  `CREATE TABLE IF NOT EXISTS mail_summary_items (message_id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, batch_id TEXT, status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending','claimed','accepted','failed','unknown')), sender_email TEXT NOT NULL, sender_name TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '', recipient_address TEXT NOT NULL, received_at TEXT NOT NULL, reply_from TEXT NOT NULL, reply_to_json TEXT NOT NULL DEFAULT '[]', in_reply_to TEXT, references_json TEXT NOT NULL DEFAULT '[]', created_at TEXT NOT NULL, claimed_at TEXT, error_code TEXT, attempts INTEGER NOT NULL DEFAULT 0)`,
+  `CREATE INDEX IF NOT EXISTS mail_summary_items_pending ON mail_summary_items (mailbox_id, status, created_at, message_id)`,
+  `CREATE INDEX IF NOT EXISTS mail_summary_items_batch ON mail_summary_items (batch_id, status)`,
+  `CREATE TABLE IF NOT EXISTS mail_summary_batches (id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('claiming','sending','accepted','failed','unknown')), item_count INTEGER NOT NULL, provider_message_id TEXT, error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS mail_summary_batches_recovery ON mail_summary_batches (mailbox_id, status, updated_at)`,
+  `INSERT OR IGNORE INTO mail_schema_migrations (version, applied_at) VALUES (4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
 ];
 
 const initialized = new WeakSet<object>();

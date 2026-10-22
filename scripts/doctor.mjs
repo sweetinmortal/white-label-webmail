@@ -78,9 +78,18 @@ if (company && !['r2', 'turso'].includes(storageProvider)) errors.push('storageP
 if (company && !['mailjet', 'cloudflare'].includes(usageAlertDelivery)) errors.push('usageAlerts.delivery debe ser mailjet o cloudflare.');
 let companyHost;
 if (company) {
-  if (company.archiveCopies !== undefined && (!company.archiveCopies || typeof company.archiveCopies.enabled !== 'boolean'
-    || (company.archiveCopies.incomingMode !== undefined && !['attachment', 'forward-with-notice'].includes(company.archiveCopies.incomingMode))
-    || (company.archiveCopies.maxDecoratedBytes !== undefined && (!Number.isSafeInteger(company.archiveCopies.maxDecoratedBytes) || company.archiveCopies.maxDecoratedBytes < 1024 || company.archiveCopies.maxDecoratedBytes > 3145728)))) errors.push('archiveCopies no es válido: revisa enabled, incomingMode y el tamaño máximo de 3 MiB.');
+  if (company.archiveCopies !== undefined && (!company.archiveCopies || typeof company.archiveCopies.enabled !== 'boolean' || (company.archiveCopies.maxDecoratedBytes !== undefined && (!Number.isSafeInteger(company.archiveCopies.maxDecoratedBytes) || company.archiveCopies.maxDecoratedBytes < 1024 || company.archiveCopies.maxDecoratedBytes > 3145728)))) errors.push('archiveCopies no es válido: revisa enabled y el tamaño máximo de 3 MiB.');
+  if (company.incomingSummary !== undefined) {
+    const summary = company.incomingSummary;
+    if (!summary || typeof summary.enabled !== 'boolean' || !Number.isSafeInteger(summary.batchSize) || summary.batchSize < 1 || summary.batchSize > 50) {
+      errors.push('incomingSummary no es válido: revisa enabled y batchSize.');
+    } else if (summary.enabled) {
+      if (!summary.from || typeof summary.from.email !== 'string' || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(summary.from.email)) errors.push('incomingSummary.from.email es obligatorio cuando el resumen está activo.');
+      if (summary.from?.email === company.archiveAddress) errors.push('El remitente del resumen no puede ser el buzón de archivo.');
+      try { new Intl.DateTimeFormat('en', { timeZone: summary.timeZone ?? 'UTC' }).format(new Date()); }
+      catch { errors.push('incomingSummary.timeZone no es válida.'); }
+    }
+  }
   if (company.archiveAddress === company.mailbox?.address) errors.push('El archivo principal forma un bucle con el remitente.');
   if (!company.allowedUsers?.length) errors.push('Faltan identidades autorizadas.');
   const identityEmailPattern = /^[a-zA-Z0-9.!#$%&'*+/=?^_\x60{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9.-]*[a-zA-Z0-9])?\.[a-zA-Z]{2,63}$/;
@@ -169,7 +178,12 @@ if (deployment) {
       allowed_sender_addresses: [company.mailbox.address],
     });
   }
-  if (company?.archiveCopies?.enabled !== false) expected.push({ name: 'ARCHIVE_EMAIL_COPY', destination_address: company.archiveAddress, allowed_sender_addresses: [company.mailbox.address] });
+  const archiveEnabled = company?.archiveCopies?.enabled !== false;
+  const summaryEnabled = company?.incomingSummary?.enabled === true;
+  if (archiveEnabled || summaryEnabled) {
+    const allowedArchiveSenders = [...new Set([company.mailbox.address, ...(summaryEnabled ? [company.incomingSummary.from.email] : [])])];
+    expected.push({ name: 'ARCHIVE_EMAIL_COPY', destination_address: company.archiveAddress, allowed_sender_addresses: allowedArchiveSenders });
+  }
   if (expected.length ? !sameJson(emailBindings, expected) : hasOwn(production, 'send_email')) errors.push('Los bindings Email Service deben limitarse a los canales habilitados, archiveAddress y mailbox.address.');
 }
 
@@ -234,7 +248,7 @@ if (emailProvider === 'mailjet') requiredSecrets.push('MAILJET_API_KEY', 'MAILJE
 if (authProvider === 'google') requiredSecrets.push('GOOGLE_CLIENT_SECRET');
 if (storageProvider === 'turso') requiredSecrets.push('TURSO_AUTH_TOKEN');
 if (company?.usageAlerts?.enabled) requiredSecrets.push('CF_USAGE_API_TOKEN');
-if (company?.archiveCopies?.enabled !== false) requiredSecrets.push('ARCHIVE_LINK_KEY');
+if (company?.archiveCopies?.enabled !== false || company?.incomingSummary?.enabled) requiredSecrets.push('ARCHIVE_LINK_KEY');
 
 console.log(`Webmail: ${company?.mailbox?.address ?? 'configuración incompleta'}`);
 if (company) console.log(`Retención: ${company.retentionDays} días; almacén temporal: ${storageProvider}; presupuesto: ${(company.storageBudgetBytes / 1e9).toFixed(1)} GB.`);
