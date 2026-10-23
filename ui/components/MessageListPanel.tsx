@@ -1,6 +1,6 @@
 import { AlertCircle, Mail, RefreshCw } from 'lucide-react';
 import type { Folder, MessageSummary, SessionInfo } from '../../shared/contracts';
-import { avatarTone, formatDate, initials } from '../lib/format';
+import { avatarTone, formatListDate, initials } from '../lib/format';
 
 export default function MessageListPanel({ session, folder, unreadOnly, identityFilter, items, selectedId, loading, error, nextCursor, onUnreadOnly, onIdentityFilter, onRefresh, onSelect, onLoadMore, onSeed, seedLoading, locale }: {
   session: SessionInfo; folder: Folder; unreadOnly: boolean; identityFilter: string; items: MessageSummary[]; selectedId: string | null; loading: boolean; error: string | null; nextCursor: string | null;
@@ -34,6 +34,6 @@ function InlineError({ message, onRetry }: { message: string; onRetry: () => voi
 function MessageRow({ message, selected, onClick, locale, showIdentity }: { message: MessageSummary; selected: boolean; onClick: () => void; locale: string; showIdentity: boolean }) {
   const sender = message.direction === 'outgoing' ? message.to[0] || { email: 'Destinatario' } : message.from;
   return <button type="button" className={selected ? 'message-row selected' : 'message-row'} onClick={onClick} aria-current={selected ? 'true' : undefined}>
-    <span className={`unread-dot${message.isRead ? ' is-read' : ''}`} aria-label={message.isRead ? undefined : 'No leído'} aria-hidden={message.isRead || undefined} /><span className={`avatar avatar-${avatarTone(message.id)}`}>{initials(sender)}</span><span className="message-row-content"><span className="message-row-top"><strong>{sender.name || sender.email}</strong><time dateTime={message.createdAt}>{formatDate(message.createdAt, false, locale)}</time></span><span className="message-row-subject">{message.subject || '(Sin asunto)'}</span>{showIdentity && message.identityAddress && <span className="message-row-identity">{message.direction === 'outgoing' ? 'De' : 'Recibido en'} {message.identityAddress}</span>}</span>
+    <span className={`unread-dot${message.isRead ? ' is-read' : ''}`} aria-label={message.isRead ? undefined : 'No leído'} aria-hidden={message.isRead || undefined} /><span className={`avatar avatar-${avatarTone(message.id)}`}>{initials(sender)}</span><span className="message-row-content"><span className="message-row-top"><strong>{sender.name || sender.email}</strong><time dateTime={message.createdAt}>{formatListDate(message.createdAt, locale)}</time></span><span className="message-row-subject">{message.subject || '(Sin asunto)'}</span>{showIdentity && message.identityAddress && <span className="message-row-identity">{message.direction === 'outgoing' ? 'De' : 'Recibido en'} {message.identityAddress}</span>}</span>
   </button>;
 }

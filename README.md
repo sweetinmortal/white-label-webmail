@@ -4,6 +4,8 @@ Aplicación de correo compartida para una empresa sobre Cloudflare Workers. Cada
 
 Incluye recibidos, lectura HTML aislada, descarga y envío de adjuntos, redacción, respuestas, enviados y leído/no leído por usuario. No implementa servidores IMAP ni SMTP.
 
+En escritorio usa una barra lateral compacta y dos paneles: al abrir un mensaje, el lector sustituye la lista y se vuelve con una flecha. En las listas, los mensajes del día actual muestran solo la hora; los anteriores conservan la fecha corta.
+
 ## Componentes
 
 | Componente | Función |

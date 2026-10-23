@@ -34,10 +34,10 @@ export default function Sidebar({ session, folder, onFolder, onCompose, onTestUs
         <img src={session.brand.logo || '/brand/logo.svg'} alt={`${session.brand.name} logo`} className="brand-logo" />
         <div><strong>{session.brand.name}</strong><span>Correo</span></div>
       </div>
-      <button className="button button-primary compose-button" type="button" onClick={onCompose}><Plus size={24} />Redactar</button>
+      <button className="button button-primary compose-button" type="button" onClick={onCompose}><Plus size={20} />Redactar</button>
       <nav className="folder-nav" aria-label="Carpetas">
-        <button aria-label="Recibidos" className={folder === 'inbox' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('inbox')}><Mail size={21} /><span>Recibidos</span></button>
-        <button aria-label="Enviados" className={folder === 'sent' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('sent')}><Send size={21} /><span>Enviados</span></button>
+        <button aria-label="Recibidos" className={folder === 'inbox' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('inbox')}><Mail size={18} /><span>Recibidos</span></button>
+        <button aria-label="Enviados" className={folder === 'sent' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('sent')}><Send size={18} /><span>Enviados</span></button>
       </nav>
       <div className="sidebar-spacer" />
       <div className="retention-note"><span>Historial: {session.retentionDays} días</span><span>El archivo completo está en tu correo principal.</span></div>

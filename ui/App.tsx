@@ -15,7 +15,7 @@ type StartupState = { status: 'loading' }
   | { status: 'ready'; session: SessionInfo }
   | { status: 'login'; options: AuthOptions; authError?: AuthQueryError }
   | { status: 'error'; error: ApiRequestError };
-type MobileView = 'list' | 'reader';
+type MailView = 'list' | 'reader';
 type ComposeState = { replyTo?: MessageDetail; archiveReply?: ArchiveReplyContext };
 
 function isArchiveReplyContext(value: unknown, token: string): value is ArchiveReplyContext {
@@ -135,7 +135,7 @@ function MailApp({ session }: { session: SessionInfo }) {
   const [listLoading, setListLoading] = useState(true);
   const [listError, setListError] = useState<string | null>(null);
   const [selectedId, setSelectedId] = useState<string | null>(null);
-  const [mobileView, setMobileView] = useState<MobileView>('list');
+  const [view, setView] = useState<MailView>('list');
   const [detail, setDetail] = useState<MessageDetail | null>(null);
   const [bodyText, setBodyText] = useState<string | null>(null);
   const [bodyHtml, setBodyHtml] = useState('');
@@ -239,9 +239,6 @@ function MailApp({ session }: { session: SessionInfo }) {
       setItems((current) => reset ? page.items : [...current, ...page.items]);
       nextCursorRef.current = page.nextCursor;
       setNextCursor(page.nextCursor);
-      if (reset) {
-        setSelectedId(page.items[0]?.id ?? null);
-      }
     } catch (error) {
       if (controller.signal.aborted || folderRequestSequenceRef.current !== requestSequence) return;
       setListError(error instanceof Error ? error.message : 'No se pudo cargar la bandeja.');
@@ -283,7 +280,7 @@ function MailApp({ session }: { session: SessionInfo }) {
 
   const selectedSummary = useMemo(() => items.find((item) => item.id === selectedId), [items, selectedId]);
   const selectMessage = useCallback((message: MessageSummary) => {
-    setSelectedId(message.id); setMobileView('reader');
+    setSelectedId(message.id); setView('reader');
     if (!message.isRead) void markRead(message.id, true);
   }, [markRead]);
   const refresh = useCallback(() => {
@@ -292,7 +289,7 @@ function MailApp({ session }: { session: SessionInfo }) {
     setReloadKey((current) => current + 1);
   }, []);
   const openFolder = useCallback((nextFolder: Folder) => {
-    setFolder(nextFolder); setUnreadOnly(false); setSelectedId(null); setMobileView('list');
+    setFolder(nextFolder); setUnreadOnly(false); setSelectedId(null); setView('list');
   }, []);
   const seedLocal = useCallback(async () => {
     setSeedLoading(true);
@@ -331,7 +328,7 @@ function MailApp({ session }: { session: SessionInfo }) {
     catch (error) { setNotice(error instanceof Error ? error.message : 'No se pudo descargar el original.'); }
   }, [detail]);
   const onSent = useCallback((sentFrom?: string) => {
-    setCompose(null); setFolder('sent'); setUnreadOnly(false); setSelectedId(null); setMobileView('list');
+    setCompose(null); setFolder('sent'); setUnreadOnly(false); setSelectedId(null); setView('list');
     if (identityFilter && sentFrom) setIdentityFilter(sentFrom);
     setNotice(session.mode === 'local' ? 'Envío de prueba guardado.' : 'Mensaje aceptado por el proveedor. Revisa Enviados para ver el estado.');
     nextCursorRef.current = null;
@@ -358,10 +355,20 @@ function MailApp({ session }: { session: SessionInfo }) {
     setCompose({ replyTo: { ...detail, bodyText: bodyText ?? undefined } });
   }, [bodyText, detail]);
 
-  return <div className="app-shell" data-mobile-view={compose ? 'compose' : mobileView} style={{ '--blue': session.brand.primaryColor } as CSSProperties}>
+  const showingReader = view === 'reader' && selectedId !== null;
+  const closeReader = useCallback(() => {
+    setView('list');
+    setSelectedId(null);
+  }, []);
+
+  return <div className="app-shell" style={{ '--blue': session.brand.primaryColor } as CSSProperties}>
     <Sidebar session={session} folder={folder} onFolder={openFolder} onCompose={openCompose} onTestUsageAlert={testUsageAlert} usageAlertTestBusy={usageAlertTestBusy} usageAlertTestPending={usageAlertTestPending} />
-    <MessageListPanel session={session} folder={folder} unreadOnly={unreadOnly} identityFilter={identityFilter} items={items} selectedId={selectedId} loading={listLoading} error={listError} nextCursor={nextCursor} onUnreadOnly={setUnreadOnly} onIdentityFilter={setIdentityFilter} onRefresh={refresh} onSelect={selectMessage} onLoadMore={() => void loadFolder(false)} onSeed={session.mode === 'local' ? seedLocal : undefined} seedLoading={seedLoading} locale={session.brand.locale} />
-    <ReaderPanel session={session} detail={detail} bodyText={bodyText} html={bodyHtml} styles={bodyStyles} remoteImages={remoteImages} attachments={attachments} loading={readerLoading} error={readerError} onBack={() => setMobileView('list')} onMarkRead={(read) => { if (selectedId) void markRead(selectedId, read); }} onDownload={downloadOriginal} onDownloadAttachment={(attachment) => void downloadAttachment(attachment)} onReply={openReply} />
+    <main className="mail-main">
+      <div className={showingReader ? 'mail-list-layer is-covered' : 'mail-list-layer'} aria-hidden={showingReader || undefined} inert={showingReader}>
+        <MessageListPanel session={session} folder={folder} unreadOnly={unreadOnly} identityFilter={identityFilter} items={items} selectedId={selectedId} loading={listLoading} error={listError} nextCursor={nextCursor} onUnreadOnly={setUnreadOnly} onIdentityFilter={setIdentityFilter} onRefresh={refresh} onSelect={selectMessage} onLoadMore={() => void loadFolder(false)} onSeed={session.mode === 'local' ? seedLocal : undefined} seedLoading={seedLoading} locale={session.brand.locale} />
+      </div>
+      {showingReader && <ReaderPanel session={session} detail={detail} bodyText={bodyText} html={bodyHtml} styles={bodyStyles} remoteImages={remoteImages} attachments={attachments} loading={readerLoading} error={readerError} onBack={closeReader} onMarkRead={(read) => { if (selectedId) void markRead(selectedId, read); }} onDownload={downloadOriginal} onDownloadAttachment={(attachment) => void downloadAttachment(attachment)} onReply={openReply} />}
+    </main>
     {notice && !compose && <div className="toast" role="status">{notice}<button type="button" aria-label="Cerrar aviso" onClick={() => setNotice(null)}><X size={16} /></button></div>}
     {compose && <ComposeDialog session={session} replyTo={compose.replyTo} archiveReply={compose.archiveReply} onClose={() => setCompose(null)} onSent={onSent} />}
   </div>;
