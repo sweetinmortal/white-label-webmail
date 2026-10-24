@@ -16,7 +16,7 @@ El workflow consulta los tags `vX.Y.Z` de la plantilla. Cuando aparece uno nuevo
 2. Compara la versión base, la copia local y la versión nueva archivo por archivo.
 3. Aplica los cambios que no entren en conflicto.
 4. Actualiza `.template-version`.
-5. Ejecuta `npm run configure` y `npm run verify`, salvo que haya conflictos.
+5. Ejecuta `npm run verify`, salvo que haya conflictos. No ejecuta `configure` para no regenerar los manifiestos del cliente.
 6. Publica un pull request en la instalación.
 
 El merge es de tres vías por archivo. No depende de que los historiales de Git estén relacionados. Si la instalación y la plantilla modificaron el mismo archivo, el script deja marcadores de conflicto y abre el PR como borrador.

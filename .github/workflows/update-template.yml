@@ -72,7 +72,7 @@ jobs:
         id: verify
         if: steps.update.outputs.has_changes == 'true' && steps.existing.outputs.skip != 'true' && steps.update.outputs.has_conflicts != 'true' && steps.install.outcome == 'success'
         continue-on-error: true
-        run: npm run configure && npm run verify
+        run: npm run verify
 
       - name: Prepare pull request body
         if: steps.update.outputs.has_changes == 'true' && steps.existing.outputs.skip != 'true'
@@ -97,7 +97,7 @@ jobs:
           const verification = process.env.UPDATE_CONFLICTS === 'true'
             ? 'No se ejecutó: el PR requiere resolver conflictos.'
             : process.env.VERIFY_OUTCOME === 'success'
-              ? 'Pasó `npm run configure && npm run verify`.'
+              ? 'Pasó `npm run verify`.'
               : `No pasó. lock=${process.env.LOCK_OUTCOME || 'no ejecutado'}, install=${process.env.INSTALL_OUTCOME || 'no ejecutado'}, verify=${process.env.VERIFY_OUTCOME || 'no ejecutado'}.`;
           const tokenNote = process.env.HAS_UPDATE_BOT_TOKEN === 'true'
             ? 'El PR fue creado con `UPDATE_BOT_TOKEN`; los checks de CI se ejecutan normalmente.'
