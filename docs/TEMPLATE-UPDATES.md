@@ -25,6 +25,8 @@ El merge es de tres vías por archivo. No depende de que los historiales de Git 
 
 Se actualizan el código del Worker, la interfaz, los tests, las migraciones, `package.json` y los archivos compartidos.
 
+`package.json` se mergea por claves: la plantilla puede añadir dependencias, scripts o cambiar `version`, mientras la instalación conserva su `name`, sus scripts propios y sus dependencias locales. Un cambio en la misma clave por ambos lados se reporta como conflicto, sin dejar el JSON inválido.
+
 No se tocan:
 
 - `config/companies/*` (salvo `example.json`);

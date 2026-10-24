@@ -109,6 +109,69 @@ function isBinary(buffer) {
   return buffer.includes(0);
 }
 
+function isPlainObject(value) {
+  return value !== null && typeof value === 'object' && !Array.isArray(value);
+}
+
+function deepEqual(left, right) {
+  if (left === right) return true;
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return left.length === right.length && left.every((value, index) => deepEqual(value, right[index]));
+  }
+  if (isPlainObject(left) && isPlainObject(right)) {
+    const leftKeys = Object.keys(left);
+    const rightKeys = Object.keys(right);
+    return leftKeys.length === rightKeys.length
+      && leftKeys.every((key) => Object.hasOwn(right, key) && deepEqual(left[key], right[key]));
+  }
+  return false;
+}
+
+// Merge de tres vías para JSON: conserva las claves propias de la instalación
+// (por ejemplo el nombre del paquete o scripts locales) y aplica solo los
+// cambios de la plantilla. Los conflictos se registran por ruta.
+function mergeJson(base, local, next, path, conflicts) {
+  if (deepEqual(next, base)) return local;
+  if (deepEqual(local, base)) return next;
+  if (deepEqual(local, next)) return local;
+
+  if (isPlainObject(base) && isPlainObject(local) && isPlainObject(next)) {
+    const merged = {};
+    const keys = [...Object.keys(local), ...Object.keys(next).filter((key) => !Object.hasOwn(local, key))];
+
+    for (const key of keys) {
+      const childPath = path ? `${path}.${key}` : key;
+      const inBase = Object.hasOwn(base, key);
+      const inLocal = Object.hasOwn(local, key);
+      const inNext = Object.hasOwn(next, key);
+
+      if (!inLocal && inNext) {
+        if (!inBase) {
+          merged[key] = next[key];
+        } else if (!deepEqual(next[key], base[key])) {
+          conflicts.push(`${childPath}: borrado en la instalación y modificado en la plantilla`);
+        }
+        continue;
+      }
+
+      if (inLocal && !inNext) {
+        if (!inBase || !deepEqual(local[key], base[key])) {
+          if (inBase) conflicts.push(`${childPath}: modificado en la instalación y borrado en la plantilla`);
+          merged[key] = local[key];
+        }
+        continue;
+      }
+
+      merged[key] = mergeJson(inBase ? base[key] : undefined, local[key], next[key], childPath, conflicts);
+    }
+
+    return merged;
+  }
+
+  conflicts.push(`${path || 'valor'}: valores distintos`);
+  return local;
+}
+
 function parseTag(tag) {
   const match = /^v(\d+)\.(\d+)\.(\d+)$/.exec(tag);
   return match ? [Number(match[1]), Number(match[2]), Number(match[3])] : null;
@@ -333,6 +396,31 @@ async function main() {
       }
 
       if (equal(local, next)) continue;
+
+      if (relativePath === 'package.json') {
+        let parsed;
+        try {
+          parsed = {
+            base: JSON.parse(base.toString('utf8')),
+            local: JSON.parse(local.toString('utf8')),
+            next: JSON.parse(next.toString('utf8')),
+          };
+        } catch {
+          conflicts.push(`${relativePath}: JSON inválido`);
+          continue;
+        }
+
+        const keyConflicts = [];
+        const merged = mergeJson(parsed.base, parsed.local, parsed.next, '', keyConflicts);
+        conflicts.push(...keyConflicts.map((item) => `${relativePath}: ${item}`));
+
+        if (!deepEqual(merged, parsed.local)) {
+          await writeRepoFile(relativePath, `${JSON.stringify(merged, null, 2)}\n`);
+          changes.push({ path: relativePath, kind: keyConflicts.length > 0 ? 'conflicted' : 'merged' });
+          packageChanged = true;
+        }
+        continue;
+      }
 
       if (isBinary(local) || isBinary(base) || isBinary(next)) {
         conflicts.push(`${relativePath}: archivo binario modificado en ambos lados`);
