@@ -22,8 +22,6 @@ jobs:
     env:
       TEMPLATE_REPO: sweetinmortal/white-label-webmail
       TEMPLATE_TOKEN: ${{ secrets.TEMPLATE_TOKEN }}
-      UPDATE_SUMMARY_PATH: ${{ runner.temp }}/template-update.json
-      PR_BODY_PATH: ${{ runner.temp }}/template-update-pr.md
       GH_TOKEN: ${{ secrets.UPDATE_BOT_TOKEN || github.token }}
       HAS_UPDATE_BOT_TOKEN: ${{ secrets.UPDATE_BOT_TOKEN != '' }}
     steps:
@@ -39,6 +37,8 @@ jobs:
 
       - name: Check for template update
         id: update
+        env:
+          UPDATE_SUMMARY_PATH: ${{ runner.temp }}/template-update.json
         run: node scripts/update-from-template.mjs
 
       - name: Check for an existing pull request
@@ -81,6 +81,8 @@ jobs:
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
           LOCK_OUTCOME: ${{ steps.lock.outcome }}
           INSTALL_OUTCOME: ${{ steps.install.outcome }}
+          UPDATE_SUMMARY_PATH: ${{ runner.temp }}/template-update.json
+          PR_BODY_PATH: ${{ runner.temp }}/template-update-pr.md
         run: |
           node --input-type=module - <<'NODE'
           import { readFileSync, writeFileSync } from 'node:fs';
@@ -143,6 +145,7 @@ jobs:
           TO_VERSION: ${{ steps.update.outputs.to }}
           UPDATE_CONFLICTS: ${{ steps.update.outputs.has_conflicts }}
           VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          PR_BODY_PATH: ${{ runner.temp }}/template-update-pr.md
         run: |
           set -euo pipefail
           draft=false
