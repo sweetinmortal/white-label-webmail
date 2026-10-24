@@ -59,6 +59,8 @@ Si el repositorio es privado, el token de `GITHUB_TOKEN` puede crear la rama y e
 
 También puedes usar un GitHub App instalado solo en ese repositorio. El workflow usa `secrets.UPDATE_BOT_TOKEN` si existe y cae en `github.token` si no.
 
+La plantilla debe ser pública para que las instalaciones puedan leer sus tags sin credenciales. Mientras siga privada, configura `TEMPLATE_TOKEN` en la instalación con un token de solo lectura sobre la plantilla. El script lo usa para `git ls-remote` y `git clone`, sin escribirlo en la URL.
+
 ## Publicar una actualización
 
 En el repositorio de la plantilla:

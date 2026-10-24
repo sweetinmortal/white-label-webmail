@@ -21,6 +21,7 @@ jobs:
     timeout-minutes: 30
     env:
       TEMPLATE_REPO: sweetinmortal/white-label-webmail
+      TEMPLATE_TOKEN: ${{ secrets.TEMPLATE_TOKEN }}
       UPDATE_SUMMARY_PATH: ${{ runner.temp }}/template-update.json
       PR_BODY_PATH: ${{ runner.temp }}/template-update-pr.md
       GH_TOKEN: ${{ secrets.UPDATE_BOT_TOKEN || github.token }}

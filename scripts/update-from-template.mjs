@@ -16,7 +16,16 @@ import process from 'node:process';
 const cwd = process.cwd();
 const templateRepo = process.env.TEMPLATE_REPO || 'sweetinmortal/white-label-webmail';
 const templateUrl = process.env.TEMPLATE_GIT_URL || `https://github.com/${templateRepo}.git`;
+const templateToken = process.env.TEMPLATE_TOKEN || '';
 const requestedTag = process.env.TEMPLATE_TARGET_TAG || '';
+const gitEnvironment = { ...process.env };
+
+if (templateToken && !process.env.TEMPLATE_GIT_URL) {
+  const basic = Buffer.from(`x-access-token:${templateToken}`).toString('base64');
+  gitEnvironment.GIT_CONFIG_COUNT = '1';
+  gitEnvironment.GIT_CONFIG_KEY_0 = `http.${templateUrl}.extraheader`;
+  gitEnvironment.GIT_CONFIG_VALUE_0 = `AUTHORIZATION: basic ${basic}`;
+}
 const versionFile = '.template-version';
 const versionPath = path.join(cwd, versionFile);
 const summaryPath = process.env.UPDATE_SUMMARY_PATH || '';
@@ -57,6 +66,7 @@ function runGit(root, args) {
     cwd: root,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
+    env: gitEnvironment,
   });
 }
 
