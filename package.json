@@ -2,6 +2,7 @@
   "name": "@white-label/webmail",
   "version": "0.1.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
   "engines": {
     "node": "^22.12.0 || ^24.0.0 || >=26.0.0"
@@ -16,6 +17,7 @@
     "db:local": "wrangler d1 migrations apply company-mail-local --local --config wrangler.local.jsonc",
     "doctor": "node scripts/doctor.mjs",
     "configure": "node scripts/configure.mjs",
+    "update:template": "node scripts/update-from-template.mjs",
     "archive:key": "node scripts/install-archive-key.mjs",
     "bundle:check": "npm run verify && wrangler deploy --dry-run --config wrangler.jsonc --outdir .wrangler/deploy-check",
     "deploy:check": "npm run verify && node scripts/doctor.mjs --strict && wrangler deploy --dry-run --config wrangler.production.jsonc --outdir .wrangler/deploy-check-production",

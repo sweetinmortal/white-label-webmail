@@ -64,10 +64,20 @@ El entorno local usa un proveedor de correo simulado y almacenamiento local. No 
 
 ## Instalación
 
-En GitHub, selecciona **Use this template** para crear el repositorio de una empresa. Cada copia tiene su propia configuración, recursos y secretos; las futuras mejoras del motor no se incorporan automáticamente a las copias.
+En GitHub, selecciona **Use this template** para crear el repositorio de una empresa. Cada copia tiene su propia configuración, recursos y secretos. La copia puede activar el workflow `Update from template` para recibir las mejoras del motor como pull requests; sin ese workflow, las mejoras no se incorporan automáticamente. Consulta [Actualizaciones de la plantilla](docs/TEMPLATE-UPDATES.md).
 
 Edita una copia de `config/companies/example.json`. `mailbox` define la dirección principal, `identities` las direcciones disponibles en From y en el filtro, y `allowedUsers` la allowlist común. El ejemplo usa `contacto@empresa.example`, `ventas@empresa.example` y `admin@empresa.example`.
 
 Sigue [Instalación por empresa](docs/COMPANY-INSTALL.md) para aprovisionar Cloudflare, verificar Mailjet, autorizar el remitente del resumen y preparar las migraciones. [Operaciones](docs/OPERATIONS.md) cubre entrega, resúmenes, recuperación de lotes, cuotas y retención.
 
 La migración `migrations/0006_incoming_summary.sql` añade la deduplicación de entrantes y las tablas del resumen. Aplícala con las migraciones D1 anteriores antes de desplegar código que dependa de ella.
+
+## Actualizaciones
+
+La plantilla publica tags `vX.Y.Z`. Una instalación puede ejecutar el workflow `Update from template` para recibir los cambios como un pull request revisable. El flujo no sobrescribe la configuración de la empresa y no despliega automáticamente. Consulta [Actualizaciones de la plantilla](docs/TEMPLATE-UPDATES.md).
+
+## Licencia y contribuciones
+
+El proyecto usa la licencia [MIT](LICENSE). Las contribuciones se aceptan con el [Developer Certificate of Origin 1.1](DCO): cada commit debe incluir `Signed-off-by`. Consulta [CONTRIBUTING.md](CONTRIBUTING.md) antes de abrir un pull request.
+
+No publiques vulnerabilidades en issues; sigue [SECURITY.md](SECURITY.md).

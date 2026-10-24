@@ -1,0 +1,162 @@
+name: Update from template
+
+on:
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [template-release]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: template-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      TEMPLATE_REPO: sweetinmortal/white-label-webmail
+      UPDATE_SUMMARY_PATH: ${{ runner.temp }}/template-update.json
+      PR_BODY_PATH: ${{ runner.temp }}/template-update-pr.md
+      GH_TOKEN: ${{ secrets.UPDATE_BOT_TOKEN || github.token }}
+      HAS_UPDATE_BOT_TOKEN: ${{ secrets.UPDATE_BOT_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.UPDATE_BOT_TOKEN || github.token }}
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Check for template update
+        id: update
+        run: node scripts/update-from-template.mjs
+
+      - name: Check for an existing pull request
+        id: existing
+        if: steps.update.outputs.has_changes == 'true'
+        env:
+          BRANCH: ${{ steps.update.outputs.branch }}
+        run: |
+          set -euo pipefail
+          number=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$number" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "PR #$number is already open; leaving it untouched."
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Update package lock
+        id: lock
+        if: steps.update.outputs.has_changes == 'true' && steps.existing.outputs.skip != 'true' && steps.update.outputs.has_conflicts != 'true' && steps.update.outputs.package_changed == 'true'
+        continue-on-error: true
+        run: npm install --package-lock-only --ignore-scripts
+
+      - name: Install dependencies
+        id: install
+        if: steps.update.outputs.has_changes == 'true' && steps.existing.outputs.skip != 'true' && steps.update.outputs.has_conflicts != 'true'
+        continue-on-error: true
+        run: npm ci
+
+      - name: Verify
+        id: verify
+        if: steps.update.outputs.has_changes == 'true' && steps.existing.outputs.skip != 'true' && steps.update.outputs.has_conflicts != 'true' && steps.install.outcome == 'success'
+        continue-on-error: true
+        run: npm run configure && npm run verify
+
+      - name: Prepare pull request body
+        if: steps.update.outputs.has_changes == 'true' && steps.existing.outputs.skip != 'true'
+        env:
+          UPDATE_CONFLICTS: ${{ steps.update.outputs.has_conflicts }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+          LOCK_OUTCOME: ${{ steps.lock.outcome }}
+          INSTALL_OUTCOME: ${{ steps.install.outcome }}
+        run: |
+          node --input-type=module - <<'NODE'
+          import { readFileSync, writeFileSync } from 'node:fs';
+
+          const summary = JSON.parse(readFileSync(process.env.UPDATE_SUMMARY_PATH, 'utf8'));
+          const conflicts = summary.conflicts.length
+            ? summary.conflicts.map((item) => `- ${item}`).join('\n')
+            : '- Ninguno.';
+          const changes = summary.changes.length
+            ? summary.changes.map((item) => `- \`${item.kind}\`: \`${item.path}\``).join('\n')
+            : '- Solo cambió la versión base.';
+          const verification = process.env.UPDATE_CONFLICTS === 'true'
+            ? 'No se ejecutó: el PR requiere resolver conflictos.'
+            : process.env.VERIFY_OUTCOME === 'success'
+              ? 'Pasó `npm run configure && npm run verify`.'
+              : `No pasó. lock=${process.env.LOCK_OUTCOME || 'no ejecutado'}, install=${process.env.INSTALL_OUTCOME || 'no ejecutado'}, verify=${process.env.VERIFY_OUTCOME || 'no ejecutado'}.`;
+          const tokenNote = process.env.HAS_UPDATE_BOT_TOKEN === 'true'
+            ? 'El PR fue creado con `UPDATE_BOT_TOKEN`; los checks de CI se ejecutan normalmente.'
+            : 'El PR fue creado con `GITHUB_TOKEN`; GitHub no dispara workflows nuevos para eventos causados por ese token. Configura `UPDATE_BOT_TOKEN` para que el CI del PR se ejecute automáticamente.';
+
+          const body = `## Actualización de la plantilla\n\n`
+            + `Versión base: \`${summary.from}\`\n\n`
+            + `Versión nueva: \`${summary.to}\`\n\n`
+            + `### Cambios aplicados\n\n${changes}\n\n`
+            + `### Conflictos\n\n${conflicts}\n\n`
+            + `### Verificación\n\n${verification}\n\n`
+            + `${tokenNote}\n\n`
+            + 'Después de mergear, revisa las migraciones y despliega de forma manual con `npm run deploy`.\n';
+
+          writeFileSync(process.env.PR_BODY_PATH, body);
+          NODE
+
+      - name: Commit update
+        if: steps.update.outputs.has_changes == 'true' && steps.existing.outputs.skip != 'true'
+        env:
+          BRANCH: ${{ steps.update.outputs.branch }}
+          TO_VERSION: ${{ steps.update.outputs.to }}
+        run: |
+          set -euo pipefail
+          git config user.name "webmail-update-bot"
+          git config user.email "webmail-update-bot@users.noreply.github.com"
+          git checkout -B "$BRANCH"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -s -m "Update webmail template to $TO_VERSION"
+
+      - name: Push update branch
+        if: steps.update.outputs.has_changes == 'true' && steps.existing.outputs.skip != 'true'
+        env:
+          BRANCH: ${{ steps.update.outputs.branch }}
+        run: git push --force origin "HEAD:refs/heads/$BRANCH"
+
+      - name: Open or update pull request
+        if: steps.update.outputs.has_changes == 'true' && steps.existing.outputs.skip != 'true'
+        env:
+          BRANCH: ${{ steps.update.outputs.branch }}
+          TO_VERSION: ${{ steps.update.outputs.to }}
+          UPDATE_CONFLICTS: ${{ steps.update.outputs.has_conflicts }}
+          VERIFY_OUTCOME: ${{ steps.verify.outcome }}
+        run: |
+          set -euo pipefail
+          draft=false
+          if [ "$UPDATE_CONFLICTS" = "true" ] || [ "$VERIFY_OUTCOME" != "success" ]; then
+            draft=true
+          fi
+          title="Update webmail template to $TO_VERSION"
+          existing=$(gh pr list --head "$BRANCH" --state open --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh pr edit "$existing" --title "$title" --body-file "$PR_BODY_PATH"
+            if [ "$draft" = "true" ]; then gh pr ready "$existing" --undo; else gh pr ready "$existing"; fi
+          else
+            if [ "$draft" = "true" ]; then
+              gh pr create --base main --head "$BRANCH" --title "$title" --body-file "$PR_BODY_PATH" --draft
+            else
+              gh pr create --base main --head "$BRANCH" --title "$title" --body-file "$PR_BODY_PATH"
+            fi
+          fi
