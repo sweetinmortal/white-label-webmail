@@ -144,7 +144,18 @@ function latestTemplateTag() {
 async function writeRepoFile(relativePath, content) {
   const fullPath = path.join(cwd, relativePath);
   await mkdir(path.dirname(fullPath), { recursive: true });
-  await writeFile(fullPath, content);
+  let output = Buffer.isBuffer(content) ? content : Buffer.from(content);
+
+  // Conserva el fin de línea del archivo existente para no reescribir todo el
+  // archivo en checkouts de Windows con core.autocrlf.
+  if (!isBinary(output) && existsSync(fullPath)) {
+    const current = await readFile(fullPath);
+    if (!isBinary(current) && current.includes('\r\n') && !output.includes('\r\n')) {
+      output = Buffer.from(output.toString('utf8').replace(/\r?\n/g, '\r\n'));
+    }
+  }
+
+  await writeFile(fullPath, output);
 }
 
 async function deleteRepoFile(relativePath) {
@@ -311,6 +322,9 @@ async function main() {
         continue;
       }
 
+      // La plantilla no cambió este archivo: la copia local manda.
+      if (equal(next, base)) continue;
+
       if (equal(local, base)) {
         await writeRepoFile(relativePath, next);
         changes.push({ path: relativePath, kind: 'updated' });
@@ -318,7 +332,7 @@ async function main() {
         continue;
       }
 
-      if (equal(next, base) || equal(local, next)) continue;
+      if (equal(local, next)) continue;
 
       if (isBinary(local) || isBinary(base) || isBinary(next)) {
         conflicts.push(`${relativePath}: archivo binario modificado en ambos lados`);
