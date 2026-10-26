@@ -53,15 +53,16 @@ El workflow se ejecuta a diario y también manualmente:
 gh workflow run update-template.yml
 ```
 
-Si el repositorio es privado, el token de `GITHUB_TOKEN` puede crear la rama y el PR, pero GitHub no ejecuta workflows nuevos para eventos causados por ese token. Para que el CI del PR se ejecute, crea un token de bot:
+El token de `GITHUB_TOKEN` puede crear la rama y el PR, pero GitHub no ejecuta workflows nuevos para eventos causados por ese token. Para que el CI del PR se ejecute automáticamente, crea un token de bot:
 
-1. Crea un **fine-grained personal access token** limitado al repositorio de la instalación.
-2. Dale permisos de **Contents: read and write** y **Pull requests: read and write**.
-3. Guárdalo como secreto `UPDATE_BOT_TOKEN` en el repositorio de la instalación.
+1. Crea un **fine-grained personal access token** limitado a los repositorios de instalación que correspondan.
+2. Dale permisos de **Contents: read and write**, **Pull requests: read and write** y **Workflows: read and write**. El permiso de Workflows es necesario cuando la actualización toca archivos de `.github/workflows/`.
+3. Usa una caducidad corta, por ejemplo 90 días, y renueva el token antes de que venza.
+4. Guárdalo como secreto `UPDATE_BOT_TOKEN` en cada repositorio de instalación.
 
-También puedes usar un GitHub App instalado solo en ese repositorio. El workflow usa `secrets.UPDATE_BOT_TOKEN` si existe y cae en `github.token` si no.
+También puedes usar un GitHub App instalado solo en ese repositorio. El workflow usa `secrets.UPDATE_BOT_TOKEN` si existe y cae en `github.token` si no. Los PRs creados con `GITHUB_TOKEN` no disparan CI; los creados con el token de bot o con un GitHub App sí.
 
-La plantilla debe ser pública para que las instalaciones puedan leer sus tags sin credenciales. Mientras siga privada, configura `TEMPLATE_TOKEN` en la instalación con un token de solo lectura sobre la plantilla. El script lo usa para `git ls-remote` y `git clone`, sin escribirlo en la URL.
+La plantilla es pública para que las instalaciones puedan leer sus tags sin credenciales. Si en el futuro vuelve a ser privada, configura `TEMPLATE_TOKEN` en la instalación con un token de solo lectura sobre la plantilla. El script lo usa para `git ls-remote` y `git clone`, sin escribirlo en la URL.
 
 ## Publicar una actualización
 
