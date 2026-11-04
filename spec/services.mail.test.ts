@@ -4,10 +4,12 @@ import { Miniflare, convertV4MiniflareOptions } from 'miniflare';
 import type { Env, Identity, IncomingEmail, MailConfig } from '../worker/types';
 import { AppError } from '../worker/errors';
 import { seedLocal } from '../worker/dev';
-import { cleanup, getMessage, getOutgoingAttachment, listMessages, processWebhook, receiveEmail, setRead, sendMessage } from '../worker/services/mail';
+import { cleanup, deleteDraft, flushScheduledMessages, getDraft, getMessage, getOutgoingAttachment, listDrafts, listMessages, processWebhook, receiveEmail, saveDraft, setRead, sendMessage } from '../worker/services/mail';
 import { localProvider } from '../worker/providers/local';
 import type { OutboundMessage } from '../worker/providers/types';
 import { openArchiveReply, sealArchiveReply } from '../worker/services/archive-links';
+import { flushIncomingSummaries, incomingSummaryDue } from '../worker/services/incoming-summary';
+import { recoverStaleScheduledOutbox } from '../worker/store/outbox';
 
 type StoredMessage = Record<string, any>;
 
@@ -32,6 +34,8 @@ class FakeD1 {
   webhookEvents = new Set<string>();
   summaryItems = new Map<string, StoredMessage>();
   summaryBatches = new Map<string, StoredMessage>();
+  messageFilters = new Map<string, StoredMessage>();
+  drafts = new Map<string, StoredMessage>();
   failWebhookBatchOnce = false;
   prepare(sql: string) { return new FakeStatement(this, sql); }
   async batch(statements: FakeStatement[]) {
@@ -105,7 +109,7 @@ class FakeD1 {
     if (sql.startsWith("UPDATE mail_summary_items SET status = 'claimed'")) {
       const [batchId, claimedAt, mailboxId, maxAttempts, limit] = args;
       const rows = [...this.summaryItems.values()]
-        .filter((row) => row.mailbox_id === mailboxId && row.status === 'pending' && row.attempts < maxAttempts)
+        .filter((row) => row.mailbox_id === mailboxId && row.status === 'pending' && row.attempts < maxAttempts && !this.messageFilters.has(row.message_id))
         .sort((a, b) => a.created_at.localeCompare(b.created_at) || a.message_id.localeCompare(b.message_id))
         .slice(0, limit);
       for (const row of rows) {
@@ -182,13 +186,13 @@ class FakeD1 {
     if (sql.startsWith('DELETE FROM mail_summary_batches WHERE id IN')) return result();
     if (sql.startsWith('DELETE FROM mail_summary_items WHERE message_id IN')) return result();
     if (sql.includes("INSERT INTO mail_messages") && sql.includes("'outgoing'")) {
-      const [id, mailboxId, fromEmail, fromName, toJson, ccJson, subject, replyToJson, rfcMessageId, referencesJson, bodyText, payloadKey, sizeBytes, createdAt, sentAt, expiresAt, archiveAddress] = args;
-      this.messages.push({ id, mailbox_id: mailboxId, direction: 'outgoing', from_email: fromEmail, from_name: fromName, to_json: toJson, cc_json: ccJson, subject, reply_to_json: replyToJson, rfc_message_id: rfcMessageId, references_json: referencesJson, body_text: bodyText, raw_key: null, payload_key: payloadKey, size_bytes: sizeBytes, created_at: createdAt, received_at: null, sent_at: sentAt, expires_at: expiresAt, receipt_id: null, archive_address: archiveAddress, archive_status: 'pending', send_status: 'pending', delete_state: 'active' });
+      const [id, mailboxId, fromEmail, fromName, toJson, ccJson, subject, replyToJson, rfcMessageId, referencesJson, bodyText, payloadKey, sizeBytes, createdAt, sentAt, expiresAt, archiveAddress, sendStatus] = args;
+      this.messages.push({ id, mailbox_id: mailboxId, direction: 'outgoing', from_email: fromEmail, from_name: fromName, to_json: toJson, cc_json: ccJson, subject, reply_to_json: replyToJson, rfc_message_id: rfcMessageId, references_json: referencesJson, body_text: bodyText, raw_key: null, payload_key: payloadKey, size_bytes: sizeBytes, created_at: createdAt, received_at: null, sent_at: sentAt, expires_at: expiresAt, receipt_id: null, archive_address: archiveAddress, archive_status: 'pending', send_status: sendStatus ?? 'pending', delete_state: 'active' });
       return result(1);
     }
     if (sql.startsWith('INSERT INTO mail_outbox (')) {
-      const [id, mailboxId, key, hash, payloadKey, provider, correlationId, createdAt, updatedAt] = args;
-      this.outboxes.set(id, { id, mailbox_id: mailboxId, idempotency_key: key, payload_hash: hash, payload_key: payloadKey, provider, correlation_id: correlationId, status: 'pending', created_at: createdAt, updated_at: updatedAt }); return result(1);
+      const [id, mailboxId, key, hash, payloadKey, provider, correlationId, scheduledAt, createdAt, updatedAt] = args;
+      this.outboxes.set(id, { id, mailbox_id: mailboxId, idempotency_key: key, payload_hash: hash, payload_key: payloadKey, provider, correlation_id: correlationId, scheduled_at: scheduledAt ?? null, status: 'pending', created_at: createdAt, updated_at: updatedAt }); return result(1);
     }
     if (sql.startsWith('INSERT INTO mail_outbox_recipients')) {
       const [outboxId, email, kind, updatedAt] = args; this.recipients.push({ outbox_id: outboxId, email, kind, provider_id: null, provider_uuid: null, status: 'pending', updated_at: updatedAt }); return result(1);
@@ -198,7 +202,14 @@ class FakeD1 {
     }
     if (sql.startsWith('INSERT OR REPLACE INTO mail_idempotency_tombstones')) return result(1);
     if (sql.startsWith("UPDATE mail_outbox SET status = 'sending'")) {
-      const row = this.outboxes.get(args[1]); if (!row || row.status !== 'pending') return result(); row.status = 'sending'; row.updated_at = args[0]; return result(1);
+      const row = this.outboxes.get(args[1]);
+      if (!row || row.status !== 'pending') return result();
+      if (sql.includes('scheduled_at IS NULL OR scheduled_at <= ?') && row.scheduled_at && row.scheduled_at > args[2]) return result();
+      if (sql.includes("scheduled_at IS NOT NULL AND scheduled_at <= ?") && (!row.scheduled_at || row.scheduled_at > args[2])) return result();
+      row.status = 'sending'; row.updated_at = args[0]; return result(1);
+    }
+    if (sql.startsWith("UPDATE mail_outbox SET status = 'unknown', error_code")) {
+      const row = this.outboxes.get(args[1]); if (row) { row.status = 'unknown'; row.error_code = 'scheduled_send_unknown'; row.updated_at = args[0]; } return result(row ? 1 : 0);
     }
     if (sql.startsWith('UPDATE mail_outbox SET status = ?, error_code')) {
       const row = this.outboxes.get(args[3]); if (row) { row.status = args[0]; row.error_code = args[1]; row.updated_at = args[2]; } return result(row ? 1 : 0);
@@ -207,6 +218,11 @@ class FakeD1 {
       const [providerId, providerUuid, status, updatedAt, outboxId, email, kind] = args; const row = this.recipients.find((item) => item.outbox_id === outboxId && item.email === email && item.kind === kind); if (row) { row.provider_id = providerId; row.provider_uuid = providerUuid; row.status = status; row.updated_at = updatedAt; } return result(row ? 1 : 0);
     }
     if (sql.startsWith('UPDATE mail_messages SET send_status')) {
+      if (sql.includes("SET send_status = 'unknown'")) {
+        const row = this.messages.find((item) => item.id === args[0] && ['scheduled', 'sending'].includes(item.send_status));
+        if (row) row.send_status = 'unknown';
+        return result(row ? 1 : 0);
+      }
       if (sql.includes("SET send_status = 'failed'")) {
         const row = this.messages.find((item) => item.id === args[0]);
         if (row) { row.send_status = 'failed'; if (row.archive_status === 'pending') row.archive_status = 'failed'; }
@@ -238,6 +254,25 @@ class FakeD1 {
     if (sql.startsWith('DELETE FROM mail_outbox WHERE')) { this.outboxes.delete(args[0]); return result(1); }
     if (sql.startsWith('DELETE FROM mail_messages WHERE')) { this.messages = this.messages.filter((item) => item.id !== args[0]); return result(1); }
     if (sql.startsWith('DELETE FROM mail_idempotency_tombstones') || sql.startsWith('DELETE FROM mail_webhook_events')) return result(1);
+    if (sql.startsWith('INSERT INTO mail_drafts')) {
+      const [id, mailboxId, userEmail, fromAddress, toText, ccText, bccText, subject, preview, payloadKey, payloadBytes, attachmentCount, attachmentBytes, createdAt, updatedAt] = args;
+      this.drafts.set(id, { id, mailbox_id: mailboxId, user_email: userEmail, from_address: fromAddress, to_text: toText, cc_text: ccText, bcc_text: bccText, subject, preview, payload_key: payloadKey, payload_bytes: payloadBytes, attachment_count: attachmentCount, attachment_bytes: attachmentBytes, created_at: createdAt, updated_at: updatedAt });
+      return result(1);
+    }
+    if (sql.startsWith('DELETE FROM mail_drafts WHERE id = ? AND mailbox_id = ? AND user_email = ?')) {
+      const row = this.drafts.get(args[0]);
+      if (!row || row.mailbox_id !== args[1] || row.user_email !== args[2]) return result();
+      this.drafts.delete(args[0]);
+      return result(1);
+    }
+    if (sql.startsWith('INSERT INTO mail_message_filters')) {
+      const [messageId, mailboxId, label, ruleId, createdAt] = args;
+      if (!this.messageFilters.has(messageId)) this.messageFilters.set(messageId, { message_id: messageId, mailbox_id: mailboxId, label, rule_id: ruleId, created_at: createdAt });
+      return result(1);
+    }
+    if (sql.startsWith('DELETE FROM mail_message_filters')) {
+      return result(this.messageFilters.delete(args[0]) ? 1 : 0);
+    }
     if (sql.includes("INSERT INTO mail_messages") && sql.includes("'incoming'")) {
       const [id, mailboxId, fromEmail, fromName, toJson, ccJson, subject, replyToJson, rfcMessageId, referencesJson, rawKey, sizeBytes, createdAt, receivedAt, expiresAt, receiptId, archiveAddress, archiveStatus, incomingKey] = args;
       if (incomingKey && this.messages.some((row) => row.mailbox_id === mailboxId && row.incoming_key === incomingKey)) {
@@ -259,16 +294,25 @@ class FakeD1 {
       return (row ? { id: row.id } : null) as T;
     }
     if (sql.includes('SELECT COUNT(*) AS count FROM mail_summary_items')) {
-      const count = [...this.summaryItems.values()].filter((row) => row.mailbox_id === args[0] && row.status === 'pending' && row.attempts < args[1]).length;
+      const count = [...this.summaryItems.values()].filter((row) => row.mailbox_id === args[0] && row.status === 'pending' && row.attempts < args[1] && !this.messageFilters.has(row.message_id)).length;
       return { count } as T;
     }
     if (sql.includes('SELECT used_bytes')) {
       const row = this.storage.get(args[0]);
       return (row ? { used_bytes: row.used, budget_bytes: row.budget, paused: row.paused } : null) as T;
     }
-    if (sql.includes('SELECT id, status, payload_hash FROM mail_outbox')) {
+    if (sql.includes('SELECT COUNT(*) AS count, COALESCE(SUM(payload_bytes), 0) AS bytes FROM mail_drafts')) {
+      const rows = [...this.drafts.values()].filter((row) => row.mailbox_id === args[0] && row.user_email === args[1]);
+      return { count: rows.length, bytes: rows.reduce((total, row) => total + Number(row.payload_bytes || 0), 0) } as T;
+    }
+    if (sql.includes('FROM mail_drafts WHERE id = ?')) {
+      const row = this.drafts.get(args[0]);
+      if (!row || row.mailbox_id !== args[1] || (args.length > 2 && row.user_email !== args[2])) return null;
+      return { ...row } as T;
+    }
+    if (sql.includes('SELECT id, status, payload_hash') && sql.includes('FROM mail_outbox')) {
       const row = [...this.outboxes.values()].find((item) => item.mailbox_id === args[0] && item.idempotency_key === args[1]);
-      return (row ? { id: row.id, status: row.status, payload_hash: row.payload_hash } : null) as T;
+      return (row ? { id: row.id, status: row.status, payload_hash: row.payload_hash, scheduled_at: row.scheduled_at ?? null } : null) as T;
     }
     if (sql.includes('SELECT r.outbox_id, r.email FROM mail_outbox_recipients')) {
       const custom = sql.includes('o.id = ?');
@@ -278,13 +322,14 @@ class FakeD1 {
       return (row ? { outbox_id: row.outbox_id, email: row.email } : null) as T;
     }
     if (sql.includes('SELECT COUNT(*) AS count FROM mail_messages')) {
-      const count = this.messages.filter((row) => row.expires_at <= args[1] && ['active', 'deleting'].includes(row.delete_state) && (['pending', 'failed', 'unknown'].includes(row.archive_status) || ['pending', 'sending', 'unknown'].includes(row.send_status))).length;
+      const count = this.messages.filter((row) => row.expires_at <= args[1] && ['active', 'deleting'].includes(row.delete_state) && (['pending', 'failed', 'unknown'].includes(row.archive_status) || ['pending', 'sending', 'scheduled', 'unknown'].includes(row.send_status))).length;
       return { count } as T;
     }
-    if (sql.includes('SELECT m.*, CASE')) {
+    if (sql.includes('SELECT m.*,') && sql.includes('WHERE m.id = ?')) {
       const row = this.messages.find((item) => item.id === args[1] && item.mailbox_id === args[2] && item.delete_state !== 'deleted');
       if (!row) return null;
-      return { ...row, is_read: this.reads.has(`${row.id}|${args[0]}`) ? 1 : 0 } as T;
+      const filter = this.messageFilters.get(row.id);
+      return { ...row, filter_label: filter?.label ?? null, filter_rule_id: filter?.rule_id ?? null, is_read: this.reads.has(`${row.id}|${args[0]}`) ? 1 : 0 } as T;
     }
     return null;
   }
@@ -302,17 +347,54 @@ class FakeD1 {
         .slice(0, args[2]);
       return { results: rows.map((row) => ({ id: row.id, status: row.status })) as T[] };
     }
+    if (sql.includes("FROM mail_outbox WHERE status = 'pending' AND scheduled_at IS NOT NULL")) {
+      const now = args[0]; const limit = Number(args[1] ?? 20);
+      const rows = [...this.outboxes.values()]
+        .filter((row) => row.status === 'pending' && row.scheduled_at && row.scheduled_at <= now)
+        .sort((a, b) => a.scheduled_at.localeCompare(b.scheduled_at) || a.id.localeCompare(b.id))
+        .slice(0, limit);
+      return { results: rows.map((row) => ({ id: row.id, mailbox_id: row.mailbox_id, payload_key: row.payload_key, provider: row.provider, scheduled_at: row.scheduled_at, created_at: row.created_at })) as T[] };
+    }
+    if (sql.includes("FROM mail_outbox WHERE status = 'sending' AND scheduled_at IS NOT NULL")) {
+      const rows = [...this.outboxes.values()]
+        .filter((row) => row.status === 'sending' && row.scheduled_at && row.updated_at <= args[0])
+        .sort((a, b) => a.updated_at.localeCompare(b.updated_at))
+        .slice(0, 20);
+      return { results: rows.map((row) => ({ id: row.id })) as T[] };
+    }
+    if (sql.includes('FROM mail_drafts WHERE mailbox_id = ? AND user_email = ?')) {
+      const limit = Number(args[2] ?? 100);
+      const rows = [...this.drafts.values()]
+        .filter((row) => row.mailbox_id === args[0] && row.user_email === args[1])
+        .sort((a, b) => b.updated_at.localeCompare(a.updated_at) || b.id.localeCompare(a.id))
+        .slice(0, limit);
+      return { results: rows.map((row) => ({ ...row })) as T[] };
+    }
     if (sql.includes('ORDER BY m.created_at DESC')) {
       const userEmail = args[0];
       const mailboxId = args[1];
-      const direction = args[2];
+      const limit = Number(args[args.length - 1]);
+      const whereSql = sql.split(' WHERE ')[1]?.split(' ORDER BY ')[0] ?? '';
+      const direction = whereSql.includes("AND m.direction = 'outgoing'") ? 'outgoing' : whereSql.includes("AND m.direction = 'incoming'") ? 'incoming' : undefined;
+      const label = sql.includes('f.label = ?') ? args[2] : undefined;
       const unreadOnly = sql.includes('r.message_id IS NULL');
-      let rows = this.messages.filter((row) => row.mailbox_id === mailboxId && row.direction === direction && row.delete_state === 'active' && (!unreadOnly || !this.reads.has(`${row.id}|${userEmail}`)));
+      const unreadIncludesOutgoing = sql.includes("m.direction = 'outgoing' OR r.message_id IS NULL");
+      const filteredOnly = sql.includes('f.message_id IS NOT NULL');
+      const unfilteredOnly = sql.includes('f.message_id IS NULL');
+      let rows = this.messages.filter((row) => row.mailbox_id === mailboxId && row.delete_state === 'active'
+        && (!direction || row.direction === direction)
+        && (!unreadOnly || (unreadIncludesOutgoing && row.direction === 'outgoing') || !this.reads.has(`${row.id}|${userEmail}`))
+        && (!filteredOnly || this.messageFilters.has(row.id))
+        && (!unfilteredOnly || !this.messageFilters.has(row.id))
+        && (!label || this.messageFilters.get(row.id)?.label === label));
       rows.sort((a, b) => b.created_at.localeCompare(a.created_at) || b.id.localeCompare(a.id));
-      return { results: rows.map((row) => ({ ...row, is_read: this.reads.has(`${row.id}|${userEmail}`) ? 1 : 0 })) as T[] };
+      return { results: rows.slice(0, limit).map((row) => {
+        const filter = this.messageFilters.get(row.id);
+        return { ...row, filter_label: filter?.label ?? null, filter_rule_id: filter?.rule_id ?? null, is_read: this.reads.has(`${row.id}|${userEmail}`) ? 1 : 0 };
+      }) as T[] };
     }
     if (sql.includes('FROM mail_messages m LEFT JOIN mail_outbox')) {
-      const now = args[1]; const rows = this.messages.filter((row) => row.mailbox_id === args[0] && row.expires_at <= now && ['active', 'deleting'].includes(row.delete_state) && !['pending', 'failed', 'unknown'].includes(row.archive_status) && !['pending', 'sending', 'unknown'].includes(row.send_status));
+      const now = args[1]; const rows = this.messages.filter((row) => row.mailbox_id === args[0] && row.expires_at <= now && ['active', 'deleting'].includes(row.delete_state) && !['pending', 'failed', 'unknown'].includes(row.archive_status) && !['pending', 'sending', 'scheduled', 'unknown'].includes(row.send_status));
       return { results: rows.map((row) => ({ ...row, ...(this.outboxes.has(row.id) ? { idempotency_key: this.outboxes.get(row.id).idempotency_key, payload_hash: this.outboxes.get(row.id).payload_hash, outbox_status: this.outboxes.get(row.id).status } : {}) })) as T[] };
     }
     return { results: [] };
@@ -345,15 +427,24 @@ const archiveKey = Buffer.from(Array.from({ length: 32 }, (_, index) => 255 - in
 function productionArchiveConfig(): MailConfig {
   return { ...config(), mode: 'production', provider: 'mailjet', archiveCopies: { enabled: true, maxDecoratedBytes: 3 * 1024 * 1024 } };
 }
-function summaryConfig(batchSize = 5): MailConfig {
+function summaryConfig(): MailConfig {
   return {
     ...config(),
     incomingSummary: {
       enabled: true,
-      batchSize,
       from: { email: 'webmail@example.com', name: 'Webmail de Mi Empresa' },
       timeZone: 'UTC',
+      schedule: { hour: 8, minute: 0, weekdaysOnly: true },
     },
+  };
+}
+function filteredConfig(): MailConfig {
+  return {
+    ...config(),
+    incomingFilters: [
+      { id: 'payments', label: 'Pagos', from: ['payments@example.test'] },
+      { id: 'automation', label: 'Automatizados', subjectContains: ['Scheduled report failed'] },
+    ],
   };
 }
 function summaryEnvironment(db: FakeD1, storage: FakeR2, sent: any[]): Env {
@@ -384,10 +475,10 @@ function env(db: FakeD1, mail = new FakeR2()): Env { return { DB: db as any, MAI
 function identity(mailboxId = 'company-a', email = 'alice@example.com'): Identity { return { email, mailboxIds: [mailboxId] }; }
 
 let incomingSequence = 0;
-function incoming(subject: string, forwardResult = true, messageId = `<incoming-${++incomingSequence}@example.net>`, recipient = 'company-a@example.com'): { message: IncomingEmail; rejected: string[]; forwarded: string[] } {
+function incoming(subject: string, forwardResult = true, messageId = `<incoming-${++incomingSequence}@example.net>`, recipient = 'company-a@example.com', from = 'sender@example.net'): { message: IncomingEmail; rejected: string[]; forwarded: string[] } {
   const rejected: string[] = []; const forwarded: string[] = [];
-  const raw = new TextEncoder().encode(`From: sender@example.net\r\nSubject: ${subject}\r\nMessage-ID: ${messageId}\r\n\r\nhello`);
-  const message: IncomingEmail = { from: 'sender@example.net', to: recipient, raw: new Blob([raw]).stream() as any, rawSize: raw.byteLength, headers: new Headers({ subject, 'message-id': messageId, to: recipient, from: 'sender@example.net' }), forward: async (address) => { forwarded.push(address); if (!forwardResult) throw new Error('forward failed'); }, setReject: (reason) => rejected.push(reason) };
+  const raw = new TextEncoder().encode(`From: ${from}\r\nSubject: ${subject}\r\nMessage-ID: ${messageId}\r\n\r\nhello`);
+  const message: IncomingEmail = { from, to: recipient, raw: new Blob([raw]).stream() as any, rawSize: raw.byteLength, headers: new Headers({ subject, 'message-id': messageId, to: recipient, from }), forward: async (address) => { forwarded.push(address); if (!forwardResult) throw new Error('forward failed'); }, setReject: (reason) => rejected.push(reason) };
   return { message, rejected, forwarded };
 }
 
@@ -404,21 +495,177 @@ describe('mail services', () => {
     expect(storage.objects.size).toBe(2);
   });
 
+  it('moves matching incoming mail out of Inbox while retaining forwarding and the filtered copy', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const e = env(db, storage); const cfg = filteredConfig();
+    const bank = incoming('Pago mensual', true, '<payment-filter@example.net>', 'company-a@example.com', 'Payments <PAYMENTS@example.test>');
+    await receiveEmail(e, cfg, bank.message);
+    expect(bank.forwarded).toEqual(['archive@example.com']);
+    expect((await listMessages(e, cfg, identity(), 'inbox')).items).toHaveLength(0);
+    const filtered = await listMessages(e, cfg, identity(), 'filtered');
+    expect(filtered.items).toHaveLength(1);
+    expect(filtered.items[0]).toMatchObject({ subject: 'Pago mensual', filterLabel: 'Pagos', from: { email: 'payments@example.test' } });
+    expect((await getMessage(e, cfg, identity(), filtered.items[0].id)).filterLabel).toBe('Pagos');
+    expect(storage.objects.size).toBe(1);
+
+    await receiveEmail(e, cfg, incoming('Mensaje normal').message);
+    expect((await listMessages(e, cfg, identity(), 'inbox')).items.map((item) => item.subject)).toEqual(['Mensaje normal']);
+    expect((await listMessages(e, cfg, identity(), 'filtered')).items).toHaveLength(1);
+  });
+
+  it('matches subject filters case-insensitively and forwards a duplicate only once', async () => {
+    const db = new FakeD1(); const e = env(db); const cfg = filteredConfig();
+    const first = incoming('Scheduled report failed nightly job', true, '<automation-filter@example.net>');
+    const duplicate = incoming('Scheduled report failed nightly job', true, '<automation-filter@example.net>');
+    await receiveEmail(e, cfg, first.message);
+    await receiveEmail(e, cfg, duplicate.message);
+    expect(first.forwarded).toHaveLength(1);
+    expect(duplicate.forwarded).toHaveLength(0);
+    expect(db.messages).toHaveLength(1);
+    expect(db.messageFilters.size).toBe(1);
+    expect((await listMessages(e, cfg, identity(), 'filtered')).items[0]?.filterLabel).toBe('Automatizados');
+  });
+
+  it('lists Todos with incoming and outgoing mail and filters by label name', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const e = env(db, storage); const cfg = filteredConfig();
+    await receiveEmail(e, cfg, incoming('Mensaje normal').message);
+    await receiveEmail(e, cfg, incoming('Scheduled report failed nightly job').message);
+    const sent = await sendMessage(e, cfg, identity(), { to: ['customer@example.net'], subject: 'Respuesta enviada', text: 'body' }, 'all-mail-key');
+    expect(sent.status).toBe('accepted');
+
+    const all = await listMessages(e, cfg, identity(), 'all');
+    expect(all.items).toHaveLength(3);
+    expect(all.items.filter((item) => item.direction === 'outgoing')).toHaveLength(1);
+    expect(all.items.find((item) => item.direction === 'outgoing')?.subject).toBe('Respuesta enviada');
+
+    const gmail = await listMessages(e, cfg, identity(), 'all', undefined, false, undefined, 'Automatizados');
+    expect(gmail.items).toHaveLength(1);
+    expect(gmail.items[0]).toMatchObject({ subject: 'Scheduled report failed nightly job', filterLabel: 'Automatizados' });
+
+    for (const item of all.items.filter((entry) => entry.direction === 'incoming')) {
+      await setRead(e, cfg, identity(), item.id, true);
+    }
+    const unread = await listMessages(e, cfg, identity(), 'all', undefined, true);
+    expect(unread.items.map((item) => item.subject)).toEqual(['Respuesta enviada']);
+  });
+
+  it('does not enqueue filtered mail in the daily summary', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
+    const cfg = { ...summaryConfig(), incomingFilters: filteredConfig().incomingFilters };
+    const e = summaryEnvironment(db, storage, sent);
+    await receiveEmail(e, cfg, incoming('Pago', true, '<filtered-summary@example.net>', 'company-a@example.com', 'payments@example.test').message);
+    await receiveEmail(e, cfg, incoming('Normal').message);
+    expect([...db.summaryItems.values()].map((item) => item.subject)).toEqual(['Normal']);
+  });
+
+  it('keeps a legacy filtered item out of the summary even if it is already queued', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
+    const cfg = { ...summaryConfig(), incomingFilters: filteredConfig().incomingFilters };
+    const e = summaryEnvironment(db, storage, sent);
+    await receiveEmail(e, cfg, incoming('Pago', true, '<filtered-legacy@example.net>', 'company-a@example.com', 'payments@example.test').message);
+    await receiveEmail(e, cfg, incoming('Normal').message);
+    const filtered = db.messages.find((row) => row.subject === 'Pago')!;
+    db.summaryItems.set(filtered.id, {
+      message_id: filtered.id, mailbox_id: cfg.mailbox.id, batch_id: null, status: 'pending',
+      sender_email: filtered.from_email, sender_name: filtered.from_name, subject: filtered.subject,
+      recipient_address: cfg.mailbox.address, received_at: filtered.received_at,
+      reply_from: filtered.from_email, reply_to_json: filtered.to_json, in_reply_to: null,
+      references_json: '[]', created_at: filtered.created_at, claimed_at: null, error_code: null, attempts: 0,
+    });
+
+    expect(await flushIncomingSummaries(e, cfg)).toMatchObject({ status: 'sent', sent: 1, pending: 0 });
+    expect(sent).toHaveLength(1);
+    expect(sent[0].text).toContain('Normal');
+    expect(sent[0].text).not.toContain('Pago');
+    expect(db.summaryItems.get(filtered.id)?.status).toBe('pending');
+  });
+
+  it('saves, lists, reopens, updates, scopes, and deletes private drafts', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const e = env(db, storage); const cfg = config();
+    const draftId = '11111111-1111-4111-8111-111111111111';
+    const saved = await saveDraft(e, cfg, identity(), draftId, {
+      from: 'company-a@example.com',
+      to: 'cliente@example.net',
+      cc: 'copia@example.net',
+      bcc: '',
+      subject: 'Propuesta',
+      text: 'Hola\n\nEl 1 ene 2026, Banco escribió:\n> mensaje anterior',
+      attachments: [{ filename: 'propuesta.pdf', mimeType: 'application/pdf', contentBase64: 'AAEC' }],
+      replyToMessageId: '22222222-2222-4222-8222-222222222222',
+    });
+    expect(saved).toMatchObject({
+      id: draftId, to: 'cliente@example.net', subject: 'Propuesta', preview: 'Hola',
+      attachmentCount: 1, attachmentBytes: 3, replyToMessageId: '22222222-2222-4222-8222-222222222222',
+    });
+    expect(saved.attachments).toEqual([{ filename: 'propuesta.pdf', mimeType: 'application/pdf', contentBase64: 'AAEC' }]);
+    expect(storage.objects.size).toBe(1);
+
+    const listed = await listDrafts(e, cfg, identity());
+    expect(listed).toHaveLength(1);
+    expect(listed[0]).toMatchObject({ id: draftId, subject: 'Propuesta', preview: 'Hola', attachmentCount: 1 });
+
+    const reopened = await getDraft(e, cfg, identity(), draftId);
+    expect(reopened).toMatchObject({ to: 'cliente@example.net', cc: 'copia@example.net', text: saved.text });
+    expect(reopened.attachments).toEqual(saved.attachments);
+
+    const updated = await saveDraft(e, cfg, identity(), draftId, {
+      from: 'company-a@example.com', to: 'cliente@example.net', cc: '', bcc: '', subject: 'Propuesta actualizada', text: 'Texto nuevo',
+    });
+    expect(updated.createdAt).toBe(saved.createdAt);
+    expect((await getDraft(e, cfg, identity(), draftId)).text).toBe('Texto nuevo');
+    expect((await listDrafts(e, cfg, identity()))[0].subject).toBe('Propuesta actualizada');
+
+    const bob = identity('company-a', 'bob@example.com');
+    expect(await listDrafts(e, cfg, bob)).toEqual([]);
+    await expect(getDraft(e, cfg, bob, draftId)).rejects.toMatchObject({ code: 'draft_not_found' });
+    await deleteDraft(e, cfg, bob, draftId);
+    expect((await getDraft(e, cfg, identity(), draftId)).text).toBe('Texto nuevo');
+
+    await deleteDraft(e, cfg, identity(), draftId);
+    expect(await listDrafts(e, cfg, identity())).toEqual([]);
+    expect(storage.objects.size).toBe(0);
+    await expect(getDraft(e, cfg, identity(), draftId)).rejects.toMatchObject({ code: 'draft_not_found' });
+  });
+
+  it('removes a draft after its send is accepted and keeps malformed draft payloads out', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const e = env(db, storage); const cfg = config();
+    const draftId = '33333333-3333-4333-8333-333333333333';
+    await saveDraft(e, cfg, identity(), draftId, {
+      from: 'company-a@example.com', to: 'cliente@example.net', cc: '', bcc: '', subject: 'Salida', text: 'Cuerpo',
+    });
+    expect(storage.objects.size).toBe(1);
+
+    const sent = await sendMessage(e, cfg, identity(), {
+      to: ['cliente@example.net'], subject: 'Salida', text: 'Cuerpo', draftId,
+    }, 'draft-send-key');
+    expect(sent.status).toBe('accepted');
+    expect(db.drafts.size).toBe(0);
+    expect(storage.objects.size).toBe(1); // The sent-message snapshot remains; the draft object is gone.
+    await expect(getDraft(e, cfg, identity(), draftId)).rejects.toMatchObject({ code: 'draft_not_found' });
+
+    await expect(saveDraft(e, cfg, identity(), 'short', {
+      from: 'company-a@example.com', to: 'cliente@example.net', cc: '', bcc: '', subject: 'x', text: 'x',
+    })).rejects.toMatchObject({ code: 'draft_invalid' });
+    await expect(saveDraft(e, cfg, identity(), '44444444-4444-4444-8444-444444444444', {
+      from: 'company-a@example.com', to: 'cliente@example.net', cc: '', bcc: '', subject: 'Grande', text: 'x'.repeat(cfg.maxComposeBytes + 1),
+    })).rejects.toMatchObject({ code: 'draft_too_large' });
+  });
+
   it('decodes bounded RFC 2047 sender names and subjects while retaining envelope fallback', async () => {
     const db = new FakeD1(); const e = env(db); const cfg = config();
     const encode = (value: string) => btoa(String.fromCharCode(...new TextEncoder().encode(value)));
     const encodedName = `=?UTF-8?B?${encode('María Torres')}?=`;
     const encodedSubject = `=?UTF-8?B?${encode('Propuesta para nuestro sitio')}?=`;
-    const raw = new TextEncoder().encode(`From: ${encodedName} <maria@example.com>\r\nSubject: ${encodedSubject}\r\n\r\nhello`);
+    const subject = `Invitaci&oacute;n ${encodedSubject}`;
+    const raw = new TextEncoder().encode(`From: ${encodedName} <maria@example.com>\r\nSubject: ${subject}\r\n\r\nhello`);
     const message: IncomingEmail = {
       from: 'envelope@example.net', to: cfg.mailbox.address, raw: new Blob([raw]).stream() as any, rawSize: raw.byteLength,
-      headers: new Headers({ from: `${encodedName} <maria@example.com>`, subject: encodedSubject, to: cfg.mailbox.address }),
+      headers: new Headers({ from: `${encodedName} <maria@example.com>`, subject, to: cfg.mailbox.address }),
       forward: async () => {}, setReject: (reason) => { throw new Error(reason); },
     };
     await receiveEmail(e, cfg, message);
     const item = (await listMessages(e, cfg, identity(), 'inbox')).items[0];
     expect(item.from).toEqual({ email: 'maria@example.com', name: 'María Torres' });
-    expect(item.subject).toBe('Propuesta para nuestro sitio');
+    expect(item.subject).toBe('Invitación Propuesta para nuestro sitio');
   });
 
   it('forwards even when the cache database is unavailable, and rejects only when both paths fail', async () => {
@@ -477,6 +724,8 @@ describe('mail services', () => {
     expect(rejected).toHaveLength(0);
     expect(storage.objects.size).toBe(5);
     expect(db.messages).toHaveLength(5);
+    expect([...db.summaryItems.values()].every((item) => item.status === 'pending')).toBe(true);
+    expect(await flushIncomingSummaries(e, summaryConfig())).toMatchObject({ status: 'unknown', sent: 0, pending: 0 });
     expect([...db.summaryItems.values()].every((item) => item.status === 'unknown')).toBe(true);
   });
 
@@ -495,9 +744,9 @@ describe('mail services', () => {
   it('escapes sender display names in the summary HTML', async () => {
     const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
     const e = summaryEnvironment(db, storage, sent);
-    for (let index = 0; index < 4; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Nombre ${index}`).message);
+    for (let index = 0; index < 5; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Nombre ${index}`).message);
     for (const item of db.summaryItems.values()) item.sender_name = '<img src=x onerror=alert(1)>';
-    await receiveEmail(e, summaryConfig(), incoming('Nombre final').message);
+    await flushIncomingSummaries(e, summaryConfig());
     expect(sent).toHaveLength(1);
     expect(sent[0].html).not.toContain('<img');
     expect(sent[0].html).toContain('&lt;img src=x onerror=alert(1)&gt;');
@@ -506,9 +755,9 @@ describe('mail services', () => {
   it('sanitizes control characters before sealing summary reply links', async () => {
     const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
     const e = summaryEnvironment(db, storage, sent);
-    for (let index = 0; index < 4; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Nombre ${index}`).message);
+    for (let index = 0; index < 5; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Nombre ${index}`).message);
     for (const item of db.summaryItems.values()) item.subject = 'Hola\tmundo\x01';
-    await receiveEmail(e, summaryConfig(), incoming('Nombre final').message);
+    await flushIncomingSummaries(e, summaryConfig());
     expect(sent).toHaveLength(1);
     expect(sent[0].text).toContain('Hola mundo');
     expect(sent[0].text).not.toContain('\x01');
@@ -526,6 +775,7 @@ describe('mail services', () => {
     expect(first.forwarded).toHaveLength(1);
     expect(second.forwarded).toHaveLength(0);
     expect(db.messages).toHaveLength(5);
+    await flushIncomingSummaries(e, summaryConfig());
     expect(sent).toHaveLength(1);
     expect([...db.summaryItems.values()].filter((item) => item.status === 'accepted')).toHaveLength(5);
     expect([...db.summaryItems.values()].filter((item) => item.status === 'pending')).toHaveLength(0);
@@ -545,49 +795,51 @@ describe('mail services', () => {
     expect(bytesOf([...storage.objects.values()][0])).toEqual(bytesOf(raw));
   });
 
-  it.each([4, 5, 10, 12])('sends only complete summary batches for %i incoming messages', async (count) => {
+  it.each([1, 4, 5, 10, 12])('queues %i incoming messages and sends one summary at the daily flush', async (count) => {
     const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
     const e = summaryEnvironment(db, storage, sent);
     for (let index = 0; index < count; index += 1) {
       await receiveEmail(e, summaryConfig(), incoming(`Correo ${index + 1}`).message);
     }
-    const expectedBatches = Math.floor(count / 5);
-    expect(sent).toHaveLength(expectedBatches);
-    expect([...db.summaryItems.values()].filter((item) => item.status === 'pending')).toHaveLength(count % 5);
-    expect([...db.summaryItems.values()].filter((item) => item.status === 'accepted')).toHaveLength(expectedBatches * 5);
+    expect(sent).toHaveLength(0);
+    expect([...db.summaryItems.values()].filter((item) => item.status === 'pending')).toHaveLength(count);
+    expect(await flushIncomingSummaries(e, summaryConfig())).toMatchObject({ status: 'sent', sent: 1, pending: 0 });
+    expect(sent).toHaveLength(1);
+    expect([...db.summaryItems.values()].filter((item) => item.status === 'accepted')).toHaveLength(count);
     expect(db.messages).toHaveLength(count);
-    for (const summary of sent) {
-      expect(summary.to).toBe('archive@example.com');
-      expect(summary.from).toEqual({ email: 'webmail@example.com', name: 'Webmail de Mi Empresa' });
-      expect(summary.subject).toContain('5 correos');
-      expect(summary.text).toContain('Responder en el webmail:');
-      expect(summary.text).toContain('sender@example.net');
-      expect(summary.html).toContain('Responder en el webmail');
-      expect(summary.html).toContain('https://app.example/?reply=');
-      expect((summary.text.match(/Responder en el webmail:/g) ?? [])).toHaveLength(5);
-    }
-    if (expectedBatches > 0) {
-      const token = /Responder en el webmail: https:\/\/app\.example\/\?reply=([A-Za-z0-9_.-]+)/.exec(sent[0].text)?.[1];
-      expect(token).toBeTruthy();
-      const cfg = summaryConfig();
-      storage.objects.clear();
-      db.messages = [];
-      await expect(openArchiveReply(e, cfg, token!)).resolves.toMatchObject({
-        direction: 'incoming',
-        from: 'company-a@example.com',
-        to: ['sender@example.net'],
-      });
-    }
+    const summary = sent[0];
+    expect(summary.to).toBe('archive@example.com');
+    expect(summary.from).toEqual({ email: 'webmail@example.com', name: 'Webmail de Mi Empresa' });
+    expect(summary.subject).toContain(count === 1 ? '1 correo recibido' : `${count} correos recibidos`);
+    expect(summary.text).toContain('Ver webmail: https://app.example');
+    expect((summary.text.match(/Ver webmail:/g) ?? [])).toHaveLength(1);
+    expect(summary.text).toContain('sender@example.net');
+    expect(summary.html).toContain('Ver webmail</a>');
+    expect((summary.html.match(/Ver webmail<\/a>/g) ?? [])).toHaveLength(1);
+    expect(summary.html).not.toContain('Responder en el webmail');
   });
 
-  it('claims concurrent summary batches once without double-sending items', async () => {
+  it('allows the daily summary only at 08:00 on weekdays in its timezone', () => {
+    const cfg = summaryConfig();
+    expect(incomingSummaryDue(new Date('2026-10-22T08:00:00Z'), cfg)).toBe(true);
+    expect(incomingSummaryDue(new Date('2026-10-22T08:04:00Z'), cfg)).toBe(true);
+    expect(incomingSummaryDue(new Date('2026-10-22T08:05:00Z'), cfg)).toBe(false);
+    expect(incomingSummaryDue(new Date('2026-10-24T08:00:00Z'), cfg)).toBe(false);
+    expect(incomingSummaryDue(new Date('2026-10-25T08:00:00Z'), cfg)).toBe(false);
+    const newYork = { ...cfg, incomingSummary: { ...cfg.incomingSummary!, timeZone: 'America/New_York' } };
+    expect(incomingSummaryDue(new Date('2026-10-22T12:00:00Z'), newYork)).toBe(true);
+    expect(incomingSummaryDue(new Date('2026-10-22T08:00:00Z'), newYork)).toBe(false);
+  });
+
+  it('claims concurrent daily summaries once without double-sending items', async () => {
     const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
     const e = summaryEnvironment(db, storage, sent);
     const messages = Array.from({ length: 10 }, (_, index) => incoming(`Concurrente ${index}`).message);
     await Promise.all(messages.map((message) => receiveEmail(e, summaryConfig(), message)));
-    expect(sent).toHaveLength(2);
+    await Promise.all([flushIncomingSummaries(e, summaryConfig()), flushIncomingSummaries(e, summaryConfig())]);
+    expect(sent).toHaveLength(1);
     expect(db.messages).toHaveLength(10);
-    expect(db.summaryBatches.size).toBe(2);
+    expect(db.summaryBatches.size).toBe(1);
     expect([...db.summaryBatches.values()].every((batch) => batch.status === 'accepted')).toBe(true);
     expect([...db.summaryItems.values()].every((item) => item.status === 'accepted')).toBe(true);
   });
@@ -596,6 +848,7 @@ describe('mail services', () => {
     const db = new FakeD1(); const storage = new FakeR2(); const sent: any[] = [];
     const e = summaryEnvironment(db, storage, sent);
     for (let index = 0; index < 5; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Previo ${index}`).message);
+    await flushIncomingSummaries(e, summaryConfig());
     expect(sent).toHaveLength(1);
     const accepted = [...db.summaryBatches.values()][0];
     accepted.status = 'sending'; accepted.updated_at = '2000-01-01T00:00:00.000Z';
@@ -603,9 +856,9 @@ describe('mail services', () => {
     db.summaryItems.get([...db.summaryItems.keys()][0])!.status = 'unknown';
     db.summaryItems.get([...db.summaryItems.keys()][0])!.batch_id = accepted.id;
     await receiveEmail(e, summaryConfig(), incoming('Nuevo lote 1').message);
-    for (let index = 1; index < 5; index += 1) await receiveEmail(e, summaryConfig(), incoming(`Nuevo lote ${index + 1}`).message);
+    await flushIncomingSummaries(e, summaryConfig());
     expect(sent).toHaveLength(2);
-    // The ambiguous old batch is swept before the next complete batch is sent.
+    // The ambiguous old batch is swept before the next daily summary is sent.
     expect(db.summaryBatches.get(accepted.id)?.status).toBe('unknown');
     expect([...db.summaryItems.values()].filter((item) => item.batch_id === accepted.id).every((item) => item.status === 'unknown')).toBe(true);
   });
@@ -637,6 +890,33 @@ describe('mail services', () => {
       References: '<oldest@example.net> <latest@example.net>',
     });
     expect(Object.keys(payload.Messages[0].Headers)).toEqual(['In-Reply-To', 'References']);
+  });
+
+  it('adds a Gmail-compatible HTML alternative for a quoted reply', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const cfg = productionArchiveConfig();
+    const fetchMock = vi.fn(async () => Response.json({ Messages: [
+      { Status: 'success', To: [{ Email: 'customer@example.net', MessageID: 411 }] },
+      { Status: 'success', To: [{ Email: 'archive@example.com', MessageID: 412 }] },
+    ] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const e = { ...env(db, storage), ARCHIVE_LINK_KEY: archiveKey, MAILJET_API_KEY: 'test-key', MAILJET_API_SECRET: 'test-secret' } as Env;
+    const text = 'Gracias\n\nEl jue, 22 oct 2026 a la(s) 1:57 p.m., Cliente Ejemplo (cliente@example.test) escribió:\nHola\nmundo';
+
+    const sent = await sendMessage(e, cfg, identity(), {
+      to: ['customer@example.net'], subject: 'Re: propuesta', text,
+    }, 'reply-html-alternative');
+
+    expect(sent.status).toBe('accepted');
+    const payload = JSON.parse((fetchMock.mock.calls[0][1] as RequestInit).body as string);
+    const [customer, archive] = payload.Messages;
+    expect(customer.TextPart).toBe(text);
+    expect(customer.HTMLPart).toContain('class="gmail_quote"');
+    expect(customer.HTMLPart).toContain('type="cite"');
+    expect(customer.HTMLPart).toContain('>Gracias</div>');
+    expect(customer.HTMLPart).toContain('Hola<br>\nmundo');
+    expect(customer.HTMLPart).not.toContain('&gt; Hola');
+    expect(archive.HTMLPart).toContain('class="gmail_quote"');
+    expect(archive.HTMLPart).toContain('Copia archivada por Mi Empresa.');
   });
 
   it('rejects a bad archive token before reserving quota or calling the provider', async () => {
@@ -765,6 +1045,57 @@ describe('mail services', () => {
     const db = new FakeD1(); const e = env(db); const cfg = { ...config(), monthlyRecipientLimit: 1 };
     await expect(sendMessage(e, cfg, identity(), { to: ['customer@example.net'], subject: 'quota', text: 'body' }, 'quota-key')).rejects.toMatchObject({ code: 'recipient_quota' });
     expect([...db.quotas.values()].every((row) => row.count === 0)).toBe(true);
+  });
+
+  it('stores a scheduled send and delivers it exactly once when due', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const e = env(db, storage); const cfg = config();
+    const scheduledAt = new Date(Date.now() + 10 * 60_000).toISOString();
+    const input = { to: ['customer@example.net'], subject: 'Más tarde', text: 'Cuerpo', scheduledAt };
+    const first = await sendMessage(e, cfg, identity(), input, 'scheduled-key');
+
+    expect(first).toMatchObject({ status: 'scheduled', scheduledAt });
+    expect(db.outboxes.get(first.id)).toMatchObject({ status: 'pending', scheduled_at: scheduledAt });
+    expect(db.messages.find((item) => item.id === first.id)?.send_status).toBe('scheduled');
+    expect(db.messages.find((item) => item.id === first.id)?.sent_at).toBeNull();
+    expect(db.recipients.filter((item) => item.outbox_id === first.id)).toHaveLength(2);
+
+    await expect(sendMessage(e, cfg, identity(), input, 'scheduled-key'))
+      .resolves.toEqual({ id: first.id, status: 'scheduled', reused: true, scheduledAt });
+
+    await expect(flushScheduledMessages(e, cfg, new Date(Date.now() + 5 * 60_000)))
+      .resolves.toEqual({ due: 0, sent: 0, failed: 0, unknown: 0 });
+    expect(db.outboxes.get(first.id)?.status).toBe('pending');
+
+    await expect(flushScheduledMessages(e, cfg, new Date(scheduledAt)))
+      .resolves.toEqual({ due: 1, sent: 1, failed: 0, unknown: 0 });
+    expect(db.outboxes.get(first.id)?.status).toBe('accepted');
+    expect(db.messages.find((item) => item.id === first.id)?.send_status).toBe('accepted');
+    expect(db.messages.find((item) => item.id === first.id)?.sent_at).toBeTruthy();
+
+    await expect(flushScheduledMessages(e, cfg, new Date(scheduledAt)))
+      .resolves.toEqual({ due: 0, sent: 0, failed: 0, unknown: 0 });
+    expect(db.outboxes.get(first.id)?.status).toBe('accepted');
+  });
+
+  it('marks a claimed scheduled send as unknown when the dispatcher crashes', async () => {
+    const db = new FakeD1(); const storage = new FakeR2(); const e = env(db, storage); const cfg = config();
+    const scheduledAt = new Date(Date.now() + 10 * 60_000).toISOString();
+    const sent = await sendMessage(e, cfg, identity(), { to: ['customer@example.net'], subject: 'Crash', text: 'Cuerpo', scheduledAt }, 'scheduled-crash');
+    const outbox = db.outboxes.get(sent.id)!;
+    outbox.status = 'sending';
+    outbox.updated_at = '2000-01-01T00:00:00.000Z';
+
+    await expect(recoverStaleScheduledOutbox(db as any, new Date().toISOString())).resolves.toBe(1);
+    expect(db.outboxes.get(sent.id)).toMatchObject({ status: 'unknown', error_code: 'scheduled_send_unknown' });
+    expect(db.messages.find((item) => item.id === sent.id)?.send_status).toBe('unknown');
+  });
+
+  it('rejects a scheduled time without the minimum lead time', async () => {
+    const db = new FakeD1(); const e = env(db); const cfg = config();
+    await expect(sendMessage(e, cfg, identity(), {
+      to: ['customer@example.net'], subject: 'Ahora', text: 'Cuerpo', scheduledAt: new Date(Date.now() + 10_000).toISOString(),
+    }, 'scheduled-too-soon')).rejects.toMatchObject({ code: 'schedule_invalid', status: 400 });
+    expect(db.outboxes.size).toBe(0);
   });
 
   it('adds the archive Bcc once, counts it in both quotas, and reuses an idempotent POST', async () => {

@@ -70,7 +70,7 @@ export async function enqueueSummaryItem(db: D1Database, input: SummaryItemInput
 
 export async function pendingSummaryCount(db: D1Database, mailboxId: string): Promise<number> {
   await ensureSchema(db);
-  const row = await db.prepare(`SELECT COUNT(*) AS count FROM mail_summary_items WHERE mailbox_id = ? AND status = 'pending' AND attempts < ?`).bind(mailboxId, SUMMARY_MAX_ATTEMPTS).first<{ count: number }>();
+  const row = await db.prepare(`SELECT COUNT(*) AS count FROM mail_summary_items s WHERE s.mailbox_id = ? AND s.status = 'pending' AND s.attempts < ? AND NOT EXISTS (SELECT 1 FROM mail_message_filters f WHERE f.message_id = s.message_id) AND NOT EXISTS (SELECT 1 FROM mail_message_spam p WHERE p.message_id = s.message_id AND p.mailbox_id = s.mailbox_id AND p.is_spam = 1)`).bind(mailboxId, SUMMARY_MAX_ATTEMPTS).first<{ count: number }>();
   return Number(row?.count ?? 0);
 }
 
@@ -81,7 +81,7 @@ export async function claimSummaryBatch(db: D1Database, mailboxId: string, batch
   const at = nowIso();
   await db.prepare(`INSERT INTO mail_summary_batches (id, mailbox_id, status, item_count, provider_message_id, error_code, created_at, updated_at) VALUES (?, ?, 'claiming', ?, NULL, NULL, ?, ?)`)
     .bind(batchId, mailboxId, batchSize, at, at).run();
-  await db.prepare(`UPDATE mail_summary_items SET status = 'claimed', batch_id = ?, claimed_at = ?, error_code = NULL, attempts = attempts + 1 WHERE message_id IN (SELECT message_id FROM mail_summary_items WHERE mailbox_id = ? AND status = 'pending' AND attempts < ? ORDER BY created_at ASC, message_id ASC LIMIT ?)`)
+  await db.prepare(`UPDATE mail_summary_items SET status = 'claimed', batch_id = ?, claimed_at = ?, error_code = NULL, attempts = attempts + 1 WHERE message_id IN (SELECT s.message_id FROM mail_summary_items s WHERE s.mailbox_id = ? AND s.status = 'pending' AND s.attempts < ? AND NOT EXISTS (SELECT 1 FROM mail_message_filters f WHERE f.message_id = s.message_id) AND NOT EXISTS (SELECT 1 FROM mail_message_spam p WHERE p.message_id = s.message_id AND p.mailbox_id = s.mailbox_id AND p.is_spam = 1) ORDER BY s.created_at ASC, s.message_id ASC LIMIT ?)`)
     .bind(batchId, at, mailboxId, SUMMARY_MAX_ATTEMPTS, batchSize).run();
   const rows = await db.prepare(`SELECT message_id, mailbox_id, batch_id, status, sender_email, sender_name, subject, recipient_address, received_at, reply_from, reply_to_json, in_reply_to, references_json, created_at, claimed_at, error_code, attempts FROM mail_summary_items WHERE batch_id = ? ORDER BY created_at ASC, message_id ASC`)
     .bind(batchId).all<SummaryItemRow>();

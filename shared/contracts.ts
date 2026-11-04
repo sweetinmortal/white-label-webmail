@@ -1,6 +1,6 @@
-export type Folder = 'inbox' | 'sent';
+export type Folder = 'inbox' | 'all' | 'sent' | 'filtered' | 'spam' | 'drafts';
 export type ArchiveStatus = 'pending' | 'forward_accepted' | 'smtp_accepted' | 'failed' | 'unknown';
-export type SendStatus = 'pending' | 'sending' | 'accepted' | 'failed' | 'unknown';
+export type SendStatus = 'scheduled' | 'pending' | 'sending' | 'accepted' | 'failed' | 'unknown';
 export interface Address { email: string; name?: string }
 export interface MessageSummary {
   id: string;
@@ -16,6 +16,9 @@ export interface MessageSummary {
   isRead: boolean;
   archiveStatus: ArchiveStatus;
   sendStatus?: SendStatus;
+  filterLabel?: string;
+  isSpam?: boolean;
+  spamReason?: string;
 }
 export interface AttachmentInfo { filename: string; mimeType: string; sizeBytes: number }
 export interface MessageDetail extends MessageSummary {
@@ -39,6 +42,8 @@ export interface SendInput {
   text: string;
   replyToMessageId?: string;
   archiveReplyToken?: string;
+  draftId?: string;
+  scheduledAt?: string;
 }
 export interface ArchiveReplyContext {
   token: string;
@@ -48,7 +53,38 @@ export interface ArchiveReplyContext {
   subject: string;
   direction: 'incoming' | 'outgoing';
 }
-export interface SendResult { id: string; status: SendStatus; reused: boolean }
+export interface DraftInput {
+  from: string;
+  to: string;
+  cc: string;
+  bcc: string;
+  subject: string;
+  text: string;
+  attachments?: OutgoingAttachment[];
+  replyToMessageId?: string;
+  archiveReplyToken?: string;
+}
+export interface DraftSummary {
+  id: string;
+  from: string;
+  to: string;
+  subject: string;
+  preview: string;
+  attachmentCount: number;
+  attachmentBytes: number;
+  createdAt: string;
+  updatedAt: string;
+}
+export interface DraftDetail extends DraftSummary {
+  cc: string;
+  bcc: string;
+  text: string;
+  attachments: OutgoingAttachment[];
+  replyToMessageId?: string;
+  archiveReplyToken?: string;
+}
+export interface SendResult { id: string; status: SendStatus; reused: boolean; scheduledAt?: string }
+export interface LabelInfo { id: string; name: string }
 export interface Brand { name: string; logo: string; primaryColor: string; locale: string }
 export type AuthProvider = 'google' | 'access' | 'local';
 export interface AuthOptions {
@@ -62,6 +98,7 @@ export interface SessionInfo {
   archiveAddress?: string;
   authProvider?: AuthProvider;
   identities?: Address[];
+  labels?: LabelInfo[];
   retentionDays: number;
   maxComposeBytes: number;
   maxAttachments: number;

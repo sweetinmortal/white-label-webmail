@@ -1,6 +1,7 @@
 import { Image as ImageIcon } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Attachment } from '../lib/api';
+import { collapseQuotedHtml, QUOTED_HTML_STYLES } from '../lib/quoted-html';
 
 function cidDocument(html: string, urls: Map<string, string>): string {
   if (!urls.size) return html;
@@ -17,6 +18,7 @@ export default function EmailBody({ html, styles, remoteImages, attachments, col
   const [showRemote, setShowRemote] = useState(false);
   const frameRef = useRef<HTMLIFrameElement>(null);
   const [frameHeight, setFrameHeight] = useState(420);
+  const preparedHtml = useMemo(() => collapseQuotedHtml(html), [html]);
   const cidUrls = useMemo(() => {
     const urls = new Map<string, string>();
     for (const attachment of attachments) {
@@ -37,8 +39,8 @@ export default function EmailBody({ html, styles, remoteImages, attachments, col
     const csp = `default-src 'none'; ${images}; style-src 'unsafe-inline'; font-src data:; media-src 'none'; frame-src 'none'; connect-src 'none'; form-action 'none'; base-uri 'none'`;
     const safeColor = /^#[a-f0-9]{6}$/i.test(color) ? color : '#0875d1';
     const base = `html,body{margin:0;padding:0;background:#fff;color:#172033;font:14px/1.55 Arial,Helvetica,sans-serif;overflow-wrap:anywhere}body{padding:2px}img{max-width:100%;height:auto}table{max-width:100%;border-collapse:collapse}a{color:${safeColor}}blockquote{margin:0 0 0 12px;padding-left:12px;border-left:3px solid #e5e7eb}`;
-    return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${csp}"><style>${base}\n${styles}</style></head><body>${cidDocument(html, cidUrls)}</body></html>`;
-  }, [cidUrls, color, html, showRemote, styles]);
+    return `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="Content-Security-Policy" content="${csp}"><style>${base}\n${styles}\n${QUOTED_HTML_STYLES}</style></head><body>${cidDocument(preparedHtml, cidUrls)}</body></html>`;
+  }, [cidUrls, color, preparedHtml, showRemote, styles]);
 
   useEffect(() => {
     const frame = frameRef.current;

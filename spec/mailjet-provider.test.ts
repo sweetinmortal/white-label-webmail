@@ -29,6 +29,7 @@ const archivedMessage: OutboundMessage = {
     { email: 'customer@example.net', kind: 'to' },
     { email: 'archive@example.com', kind: 'bcc' },
   ],
+  html: '<div class="gmail_quote">HTML reply</div>',
   archiveReplyToken: 'v1.opaque.reply-token',
 };
 
@@ -89,12 +90,14 @@ describe('Mailjet transport contract', () => {
     expect(customer.To).toEqual([{ Email: 'customer@example.net' }]);
     expect(customer.Bcc).toEqual([]);
     expect(customer.TextPart).toBe('A test message');
-    expect(customer).not.toHaveProperty('HTMLPart');
+    expect(customer.HTMLPart).toContain('HTML reply');
+    expect(customer.HTMLPart).not.toContain('Copia del correo enviado');
     expect(customer.TextPart).not.toContain('Copia del correo enviado');
     expect(archive.To).toEqual([{ Email: 'archive@example.com' }]);
     expect(archive.Bcc).toEqual([]);
     expect(archive.TextPart.match(/Responder en el webmail:/g)).toHaveLength(1);
     expect(archive.TextPart).toContain('Copia archivada por Example Company. Remitente original: contact@example.com.');
+    expect(archive.HTMLPart).toContain('HTML reply');
     expect(archive.HTMLPart).toContain('Copia archivada por Example Company. Remitente original: contact@example.com.');
   });
 

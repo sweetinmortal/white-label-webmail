@@ -49,7 +49,7 @@ const base = {
   preview_urls: false,
   assets: { binding: 'ASSETS', directory: './dist', not_found_handling: 'single-page-application', run_worker_first: ['/api/*'] },
   d1_databases: [{ binding: 'DB', database_name: 'company-mail', database_id: '00000000-0000-0000-0000-000000000000', migrations_dir: 'migrations' }],
-  triggers: { crons: ['15 * * * *'] },
+  triggers: { crons: ['15 * * * *', '* * * * *'] },
   vars: { APP_ENV: 'production', COMPANY_CONFIG: companyJson },
 };
 if (storageProvider === 'r2') {

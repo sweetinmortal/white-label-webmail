@@ -1,6 +1,8 @@
 import type { D1Database } from '@cloudflare/workers-types';
 
 const statements = [
+  `CREATE TABLE IF NOT EXISTS mail_message_spam (message_id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, is_spam INTEGER NOT NULL CHECK (is_spam IN (0, 1)), reason TEXT NOT NULL, source TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (message_id) REFERENCES mail_messages(id) ON DELETE CASCADE)`,
+  `CREATE INDEX IF NOT EXISTS mail_message_spam_mailbox ON mail_message_spam (mailbox_id, is_spam, message_id)`,
   `CREATE TABLE IF NOT EXISTS mail_messages (id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, direction TEXT NOT NULL, from_email TEXT NOT NULL, from_name TEXT NOT NULL DEFAULT '', to_json TEXT NOT NULL, cc_json TEXT NOT NULL DEFAULT '[]', subject TEXT NOT NULL DEFAULT '', reply_to_json TEXT, rfc_message_id TEXT, references_json TEXT NOT NULL DEFAULT '[]', body_text TEXT, raw_key TEXT, payload_key TEXT, size_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, received_at TEXT, sent_at TEXT, expires_at TEXT NOT NULL, receipt_id TEXT UNIQUE, archive_address TEXT, archive_status TEXT NOT NULL DEFAULT 'pending', send_status TEXT, delete_state TEXT NOT NULL DEFAULT 'active', delete_started_at TEXT, incoming_key TEXT)`,
   `CREATE INDEX IF NOT EXISTS mail_messages_folder_cursor ON mail_messages (mailbox_id, direction, created_at DESC, id DESC)`,
   `CREATE UNIQUE INDEX IF NOT EXISTS mail_messages_incoming_key ON mail_messages (mailbox_id, incoming_key)`,
@@ -10,7 +12,7 @@ const statements = [
   `CREATE INDEX IF NOT EXISTS mail_messages_outbox_status ON mail_messages (send_status, expires_at)`,
   `CREATE INDEX IF NOT EXISTS mail_messages_hold ON mail_messages (mailbox_id, expires_at, delete_state, archive_status, send_status)`,
   `CREATE TABLE IF NOT EXISTS mail_read_states (message_id TEXT NOT NULL, user_email TEXT NOT NULL, read_at TEXT NOT NULL, PRIMARY KEY (message_id, user_email), FOREIGN KEY (message_id) REFERENCES mail_messages(id) ON DELETE CASCADE)`,
-  `CREATE TABLE IF NOT EXISTS mail_outbox (id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_key TEXT NOT NULL, status TEXT NOT NULL, provider TEXT NOT NULL, correlation_id TEXT NOT NULL, error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (id) REFERENCES mail_messages(id) ON DELETE CASCADE, UNIQUE (mailbox_id, idempotency_key))`,
+  `CREATE TABLE IF NOT EXISTS mail_outbox (id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, idempotency_key TEXT NOT NULL, payload_hash TEXT NOT NULL, payload_key TEXT NOT NULL, status TEXT NOT NULL, provider TEXT NOT NULL, correlation_id TEXT NOT NULL, scheduled_at TEXT, error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY (id) REFERENCES mail_messages(id) ON DELETE CASCADE, UNIQUE (mailbox_id, idempotency_key))`,
   `CREATE INDEX IF NOT EXISTS mail_outbox_status ON mail_outbox (status, updated_at, id)`,
   `CREATE INDEX IF NOT EXISTS mail_outbox_correlation ON mail_outbox (correlation_id)`,
   `CREATE TABLE IF NOT EXISTS mail_outbox_recipients (outbox_id TEXT NOT NULL, email TEXT NOT NULL, kind TEXT NOT NULL CHECK (kind IN ('to','cc','bcc')), provider_id TEXT, provider_uuid TEXT, status TEXT NOT NULL DEFAULT 'pending', updated_at TEXT NOT NULL, PRIMARY KEY (outbox_id, email, kind), FOREIGN KEY (outbox_id) REFERENCES mail_outbox(id) ON DELETE CASCADE)`,
@@ -37,6 +39,12 @@ const statements = [
   `CREATE TABLE IF NOT EXISTS mail_summary_batches (id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('claiming','sending','accepted','failed','unknown')), item_count INTEGER NOT NULL, provider_message_id TEXT, error_code TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
   `CREATE INDEX IF NOT EXISTS mail_summary_batches_recovery ON mail_summary_batches (mailbox_id, status, updated_at)`,
   `INSERT OR IGNORE INTO mail_schema_migrations (version, applied_at) VALUES (4, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+  `CREATE TABLE IF NOT EXISTS mail_message_filters (message_id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, label TEXT NOT NULL, rule_id TEXT NOT NULL, created_at TEXT NOT NULL, FOREIGN KEY (message_id) REFERENCES mail_messages(id) ON DELETE CASCADE)`,
+  `CREATE INDEX IF NOT EXISTS mail_message_filters_mailbox ON mail_message_filters (mailbox_id, created_at DESC, message_id DESC)`,
+  `INSERT OR IGNORE INTO mail_schema_migrations (version, applied_at) VALUES (5, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
+  `CREATE TABLE IF NOT EXISTS mail_drafts (id TEXT PRIMARY KEY, mailbox_id TEXT NOT NULL, user_email TEXT NOT NULL, from_address TEXT NOT NULL, to_text TEXT NOT NULL DEFAULT '', cc_text TEXT NOT NULL DEFAULT '', bcc_text TEXT NOT NULL DEFAULT '', subject TEXT NOT NULL DEFAULT '', preview TEXT NOT NULL DEFAULT '', payload_key TEXT NOT NULL, payload_bytes INTEGER NOT NULL DEFAULT 0, attachment_count INTEGER NOT NULL DEFAULT 0, attachment_bytes INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, updated_at TEXT NOT NULL)`,
+  `CREATE INDEX IF NOT EXISTS mail_drafts_owner ON mail_drafts (mailbox_id, user_email, updated_at DESC, id DESC)`,
+  `INSERT OR IGNORE INTO mail_schema_migrations (version, applied_at) VALUES (6, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))`,
 ];
 
 const initialized = new WeakSet<object>();

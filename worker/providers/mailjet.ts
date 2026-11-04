@@ -31,6 +31,7 @@ export const mailjetProvider: OutboundProvider = {
         Bcc: recipients.filter((recipient) => recipient.kind === 'bcc').map(({ email }) => ({ Email: email })),
         Subject: message.subject,
         TextPart: message.text,
+        ...(message.html ? { HTMLPart: message.html } : {}),
         ...(attachments.length ? { Attachments: attachments } : {}),
         Headers: message.headers,
         CustomID: message.customId,
@@ -48,6 +49,7 @@ export const mailjetProvider: OutboundProvider = {
       const copy = archiveCopyContent(config, {
         direction: 'outgoing', token: message.archiveReplyToken, subject: message.subject,
         sender: message.from.email, recipients: customers.map(recipient => recipient.email), text: message.text,
+        html: message.html,
       });
       groups.push(archive);
       messages.push({ ...ordinary([]), To: [{ Email: message.archiveAddress }], TextPart: copy.text, HTMLPart: copy.html });

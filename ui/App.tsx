@@ -1,7 +1,8 @@
 import { LoaderCircle, X } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
-import type { ArchiveReplyContext, AuthOptions, Brand, Folder, MessageDetail, MessagePage, MessageSummary, SessionInfo } from '../shared/contracts';
+import type { ArchiveReplyContext, AuthOptions, Brand, DraftDetail, DraftSummary, Folder, MessageDetail, MessagePage, MessageSummary, SessionInfo } from '../shared/contracts';
 import ComposeDialog from './components/ComposeDialog';
+import DraftListPanel from './components/DraftListPanel';
 import LoginScreen from './components/LoginScreen';
 import MessageListPanel from './components/MessageListPanel';
 import ReaderPanel from './components/ReaderPanel';
@@ -9,6 +10,7 @@ import Sidebar from './components/Sidebar';
 import StartupScreen from './components/StartupScreen';
 import { apiFetch, ApiRequestError, getSession, MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, parseRawInWorker, requestOutgoingAttachment, requestRaw, type Attachment } from './lib/api';
 import { downloadBlob } from './lib/format';
+import { formatScheduleConfirmation } from './lib/schedule';
 
 type AuthQueryError = 'denied' | 'failed';
 type StartupState = { status: 'loading' }
@@ -16,7 +18,7 @@ type StartupState = { status: 'loading' }
   | { status: 'login'; options: AuthOptions; authError?: AuthQueryError }
   | { status: 'error'; error: ApiRequestError };
 type MailView = 'list' | 'reader';
-type ComposeState = { replyTo?: MessageDetail; archiveReply?: ArchiveReplyContext };
+type ComposeState = { replyTo?: MessageDetail; forwardOf?: MessageDetail; archiveReply?: ArchiveReplyContext; draft?: DraftDetail };
 
 function isArchiveReplyContext(value: unknown, token: string): value is ArchiveReplyContext {
   if (!value || typeof value !== 'object') return false;
@@ -128,9 +130,13 @@ export default function App() {
 
 function MailApp({ session }: { session: SessionInfo }) {
   const [folder, setFolder] = useState<Folder>('inbox');
+  const [labelFilter, setLabelFilter] = useState<string | null>(null);
   const [unreadOnly, setUnreadOnly] = useState(false);
   const [identityFilter, setIdentityFilter] = useState('');
   const [items, setItems] = useState<MessageSummary[]>([]);
+  const [drafts, setDrafts] = useState<DraftSummary[]>([]);
+  const [openingDraftId, setOpeningDraftId] = useState<string | null>(null);
+  const [deletingDraftId, setDeletingDraftId] = useState<string | null>(null);
   const [nextCursor, setNextCursor] = useState<string | null>(null);
   const [listLoading, setListLoading] = useState(true);
   const [listError, setListError] = useState<string | null>(null);
@@ -144,6 +150,9 @@ function MailApp({ session }: { session: SessionInfo }) {
   const [attachments, setAttachments] = useState<Attachment[]>([]);
   const [readerLoading, setReaderLoading] = useState(false);
   const [readerError, setReaderError] = useState<string | null>(null);
+  const [readerRetryKey, setReaderRetryKey] = useState(0);
+  const [spamSavingId, setSpamSavingId] = useState<string | null>(null);
+  const [spamActionError, setSpamActionError] = useState<{ id: string; message: string } | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [compose, setCompose] = useState<ComposeState | null>(null);
   const [seedLoading, setSeedLoading] = useState(false);
@@ -153,6 +162,10 @@ function MailApp({ session }: { session: SessionInfo }) {
   const nextCursorRef = useRef<string | null>(null);
   const folderRequestSequenceRef = useRef(0);
   const folderRequestControllerRef = useRef<AbortController | null>(null);
+  const spamActionRequestRef = useRef<number | null>(null);
+  const spamActionSequenceRef = useRef(0);
+  const selectedContextRef = useRef({ id: selectedId, folder });
+  selectedContextRef.current = { id: selectedId, folder };
   const archiveReplyStartedRef = useRef<string | null>(null);
   const archiveReplyMountedRef = useRef(false);
 
@@ -211,6 +224,34 @@ function MailApp({ session }: { session: SessionInfo }) {
     }
   }, []);
 
+  const updateSpam = useCallback(async (id: string, spam: boolean) => {
+    if (spamActionRequestRef.current !== null || selectedContextRef.current.id !== id) return;
+    const requestId = ++spamActionSequenceRef.current;
+    const startingFolder = selectedContextRef.current.folder;
+    spamActionRequestRef.current = requestId;
+    setSpamSavingId(id);
+    setSpamActionError(null);
+    try {
+      await apiFetch<void>(`/messages/${encodeURIComponent(id)}/spam`, { method: 'PATCH', body: JSON.stringify({ spam }) });
+      const currentSelection = selectedContextRef.current;
+      if (currentSelection.folder === startingFolder) setItems((current) => current.filter((item) => item.id !== id));
+      setNotice(spam ? 'Mensaje marcado como spam.' : 'Mensaje restaurado fuera de Spam.');
+      if (currentSelection.id === id && currentSelection.folder === startingFolder) {
+        setSelectedId(null);
+        setView('list');
+      }
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'No se pudo actualizar el estado de spam.';
+      if (selectedContextRef.current.id === id) setSpamActionError({ id, message });
+      else setNotice(message);
+    } finally {
+      if (spamActionRequestRef.current === requestId) {
+        spamActionRequestRef.current = null;
+        setSpamSavingId(null);
+      }
+    }
+  }, []);
+
   useEffect(() => { nextCursorRef.current = nextCursor; }, [nextCursor]);
 
   const loadFolder = useCallback(async (reset: boolean) => {
@@ -225,15 +266,25 @@ function MailApp({ session }: { session: SessionInfo }) {
       nextCursorRef.current = null;
       setNextCursor(null);
       setItems([]);
+      setDrafts([]);
       setSelectedId(null);
     }
     const cursor = reset ? null : nextCursorRef.current;
-    const endpoint = folder === 'inbox' ? '/inbox' : '/sent';
-    const params = new URLSearchParams();
-    if (cursor) params.set('cursor', cursor);
-    if (folder === 'inbox' && unreadOnly) params.set('unread', '1');
-    if (identityFilter) params.set('address', identityFilter);
     try {
+      if (folder === 'drafts') {
+        const draftItems = await apiFetch<DraftSummary[]>('/drafts', {}, controller.signal);
+        if (controller.signal.aborted || folderRequestSequenceRef.current !== requestSequence) return;
+        setDrafts(draftItems);
+        nextCursorRef.current = null;
+        setNextCursor(null);
+        return;
+      }
+      const endpoint = folder === 'inbox' ? '/inbox' : folder === 'filtered' ? '/filtered' : folder === 'all' ? '/all' : folder === 'spam' ? '/spam' : '/sent';
+      const params = new URLSearchParams();
+      if (cursor) params.set('cursor', cursor);
+      if (folder !== 'sent' && unreadOnly) params.set('unread', '1');
+      if (identityFilter) params.set('address', identityFilter);
+      if (folder === 'all' && labelFilter) params.set('label', labelFilter);
       const page = await apiFetch<MessagePage>(`${endpoint}?${params.toString()}`, {}, controller.signal);
       if (controller.signal.aborted || folderRequestSequenceRef.current !== requestSequence) return;
       setItems((current) => reset ? page.items : [...current, ...page.items]);
@@ -241,14 +292,14 @@ function MailApp({ session }: { session: SessionInfo }) {
       setNextCursor(page.nextCursor);
     } catch (error) {
       if (controller.signal.aborted || folderRequestSequenceRef.current !== requestSequence) return;
-      setListError(error instanceof Error ? error.message : 'No se pudo cargar la bandeja.');
+      setListError(error instanceof Error ? error.message : folder === 'drafts' ? 'No se pudieron cargar los borradores.' : folder === 'spam' ? 'No se pudo cargar Spam.' : 'No se pudo cargar la bandeja.');
     } finally {
       if (folderRequestSequenceRef.current === requestSequence) {
         setListLoading(false);
         if (folderRequestControllerRef.current === controller) folderRequestControllerRef.current = null;
       }
     }
-  }, [folder, unreadOnly, identityFilter]);
+  }, [folder, unreadOnly, identityFilter, labelFilter]);
 
   useEffect(() => {
     void loadFolder(true);
@@ -267,19 +318,40 @@ function MailApp({ session }: { session: SessionInfo }) {
           setAttachments((message.attachments ?? []).map((attachment, index) => ({ ...attachment, content: new ArrayBuffer(0), index })));
           return;
         }
+        if (folder === 'spam' || message.isSpam) {
+          if (message.bodyText !== undefined && message.bodyText !== null) {
+            setBodyText(message.bodyText);
+            return;
+          }
+          if (!message.rawAvailable) {
+            setBodyText('');
+            return;
+          }
+          if (message.sizeBytes > MAX_PREVIEW_BYTES) throw new Error('Este mensaje supera el límite de vista previa. Descarga el original para abrirlo.');
+          const raw = await requestRaw(message.id, controller.signal, MAX_PREVIEW_BYTES);
+          const parsed = await parseRawInWorker(raw, controller.signal);
+          if (controller.signal.aborted) return;
+          setBodyText(parsed.bodyText);
+          return;
+        }
         if (!message.rawAvailable) throw new Error('El original ya no está disponible en esta ventana local.');
         if (message.sizeBytes > MAX_PREVIEW_BYTES) throw new Error('Este mensaje supera el límite de vista previa. Descarga el original para abrirlo.');
         const raw = await requestRaw(message.id, controller.signal, MAX_PREVIEW_BYTES);
         const parsed = await parseRawInWorker(raw, controller.signal);
         setBodyText(parsed.bodyText); setBodyHtml(parsed.html); setBodyStyles(parsed.styles); setRemoteImages(parsed.remoteImages); setAttachments(parsed.attachments);
       })
-      .catch((error: unknown) => { if (!controller.signal.aborted) setReaderError(error instanceof Error ? error.message : 'No se pudo leer el mensaje.'); })
+      .catch((error: unknown) => {
+        if (controller.signal.aborted) return;
+        console.error('webmail_reader_failed', { messageId: selectedId, error });
+        setReaderError(error instanceof Error ? error.message : 'No se pudo leer el mensaje.');
+      })
       .finally(() => { if (!controller.signal.aborted) setReaderLoading(false); });
     return () => controller.abort();
-  }, [folder, selectedId, reloadKey]);
+  }, [folder, selectedId, reloadKey, readerRetryKey]);
 
   const selectedSummary = useMemo(() => items.find((item) => item.id === selectedId), [items, selectedId]);
   const selectMessage = useCallback((message: MessageSummary) => {
+    setSpamActionError(null);
     setSelectedId(message.id); setView('reader');
     if (!message.isRead) void markRead(message.id, true);
   }, [markRead]);
@@ -289,7 +361,11 @@ function MailApp({ session }: { session: SessionInfo }) {
     setReloadKey((current) => current + 1);
   }, []);
   const openFolder = useCallback((nextFolder: Folder) => {
-    setFolder(nextFolder); setUnreadOnly(false); setSelectedId(null); setView('list');
+    setSpamActionError(null);
+    setFolder(nextFolder); setLabelFilter(null); setUnreadOnly(false); setSelectedId(null); setView('list');
+  }, []);
+  const openLabel = useCallback((label: string) => {
+    setFolder('all'); setLabelFilter(label); setUnreadOnly(false); setSelectedId(null); setView('list'); setNotice(null);
   }, []);
   const seedLocal = useCallback(async () => {
     setSeedLoading(true);
@@ -328,13 +404,21 @@ function MailApp({ session }: { session: SessionInfo }) {
     catch (error) { setNotice(error instanceof Error ? error.message : 'No se pudo descargar el original.'); }
   }, [detail]);
   const onSent = useCallback((sentFrom?: string) => {
-    setCompose(null); setFolder('sent'); setUnreadOnly(false); setSelectedId(null); setView('list');
+    setCompose(null); setFolder('sent'); setLabelFilter(null); setUnreadOnly(false); setSelectedId(null); setView('list');
     if (identityFilter && sentFrom) setIdentityFilter(sentFrom);
     setNotice(session.mode === 'local' ? 'Envío de prueba guardado.' : 'Mensaje aceptado por el proveedor. Revisa Enviados para ver el estado.');
     nextCursorRef.current = null;
     setNextCursor(null);
     setReloadKey((current) => current + 1);
   }, [identityFilter, session.mode]);
+  const onScheduled = useCallback((scheduledAt: string, scheduledFrom?: string) => {
+    setCompose(null); setFolder('sent'); setLabelFilter(null); setUnreadOnly(false); setSelectedId(null); setView('list');
+    if (identityFilter && scheduledFrom) setIdentityFilter(scheduledFrom);
+    setNotice(`Mensaje programado para ${formatScheduleConfirmation(scheduledAt, session.brand.locale)}.`);
+    nextCursorRef.current = null;
+    setNextCursor(null);
+    setReloadKey((current) => current + 1);
+  }, [identityFilter, session.brand.locale]);
   const downloadAttachment = useCallback(async (attachment: Attachment) => {
     if (!detail) return;
     try {
@@ -354,22 +438,59 @@ function MailApp({ session }: { session: SessionInfo }) {
     setNotice(null);
     setCompose({ replyTo: { ...detail, bodyText: bodyText ?? undefined } });
   }, [bodyText, detail]);
-
-  const showingReader = view === 'reader' && selectedId !== null;
+  const openForward = useCallback(() => {
+    if (!detail) return;
+    setNotice(null);
+    setCompose({ forwardOf: { ...detail, bodyText: bodyText ?? undefined } });
+  }, [bodyText, detail]);
+  const openDraft = useCallback(async (draft: DraftSummary) => {
+    setNotice(null);
+    setOpeningDraftId(draft.id);
+    try {
+      const detail = await apiFetch<DraftDetail>(`/drafts/${encodeURIComponent(draft.id)}`);
+      setCompose({ draft: detail });
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo abrir el borrador.');
+    } finally {
+      setOpeningDraftId(null);
+    }
+  }, []);
+  const discardDraft = useCallback(async (draft: DraftSummary) => {
+    if (!window.confirm(`¿Descartar el borrador "${draft.subject || 'Sin asunto'}"?`)) return;
+    setDeletingDraftId(draft.id);
+    setNotice(null);
+    try {
+      await apiFetch<void>(`/drafts/${encodeURIComponent(draft.id)}`, { method: 'DELETE' });
+      setDrafts((current) => current.filter((item) => item.id !== draft.id));
+      setNotice('Borrador descartado.');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo descartar el borrador.');
+    } finally {
+      setDeletingDraftId(null);
+    }
+  }, []);
+  const closeCompose = useCallback(() => {
+    setCompose(null);
+    if (folder === 'drafts') setReloadKey((current) => current + 1);
+  }, [folder]);
+  const showingReader = folder !== 'drafts' && view === 'reader' && selectedId !== null;
   const closeReader = useCallback(() => {
+    setSpamActionError(null);
     setView('list');
     setSelectedId(null);
   }, []);
 
   return <div className="app-shell" style={{ '--blue': session.brand.primaryColor } as CSSProperties}>
-    <Sidebar session={session} folder={folder} onFolder={openFolder} onCompose={openCompose} onTestUsageAlert={testUsageAlert} usageAlertTestBusy={usageAlertTestBusy} usageAlertTestPending={usageAlertTestPending} />
+    <Sidebar session={session} folder={folder} labelFilter={labelFilter} onFolder={openFolder} onLabel={openLabel} onCompose={openCompose} onTestUsageAlert={testUsageAlert} usageAlertTestBusy={usageAlertTestBusy} usageAlertTestPending={usageAlertTestPending} />
     <main className="mail-main">
       <div className={showingReader ? 'mail-list-layer is-covered' : 'mail-list-layer'} aria-hidden={showingReader || undefined} inert={showingReader}>
-        <MessageListPanel session={session} folder={folder} unreadOnly={unreadOnly} identityFilter={identityFilter} items={items} selectedId={selectedId} loading={listLoading} error={listError} nextCursor={nextCursor} onUnreadOnly={setUnreadOnly} onIdentityFilter={setIdentityFilter} onRefresh={refresh} onSelect={selectMessage} onLoadMore={() => void loadFolder(false)} onSeed={session.mode === 'local' ? seedLocal : undefined} seedLoading={seedLoading} locale={session.brand.locale} />
+        {folder === 'drafts'
+          ? <DraftListPanel drafts={drafts} loading={listLoading} error={listError} openingId={openingDraftId} deletingId={deletingDraftId} onRefresh={refresh} onOpen={(draft) => void openDraft(draft)} onDiscard={(draft) => void discardDraft(draft)} locale={session.brand.locale} />
+          : <MessageListPanel session={session} folder={folder} labelFilter={labelFilter} unreadOnly={unreadOnly} identityFilter={identityFilter} items={items} selectedId={selectedId} loading={listLoading} error={listError} nextCursor={nextCursor} onUnreadOnly={setUnreadOnly} onIdentityFilter={setIdentityFilter} onRefresh={refresh} onSelect={selectMessage} onLoadMore={() => void loadFolder(false)} onSeed={session.mode === 'local' && folder === 'inbox' ? seedLocal : undefined} seedLoading={seedLoading} locale={session.brand.locale} />}
       </div>
-      {showingReader && <ReaderPanel session={session} detail={detail} bodyText={bodyText} html={bodyHtml} styles={bodyStyles} remoteImages={remoteImages} attachments={attachments} loading={readerLoading} error={readerError} onBack={closeReader} onMarkRead={(read) => { if (selectedId) void markRead(selectedId, read); }} onDownload={downloadOriginal} onDownloadAttachment={(attachment) => void downloadAttachment(attachment)} onReply={openReply} />}
+      {showingReader && <ReaderPanel session={session} detail={detail} isSpam={folder === 'spam' || Boolean(detail?.isSpam)} bodyText={bodyText} html={bodyHtml} styles={bodyStyles} remoteImages={remoteImages} attachments={attachments} loading={readerLoading} error={readerError} spamBusy={spamSavingId !== null} spamError={spamActionError && spamActionError.id === detail?.id ? spamActionError.message : null} onBack={closeReader} onMarkRead={(read) => { if (selectedId) void markRead(selectedId, read); }} onSetSpam={(spam) => { if (detail?.id) void updateSpam(detail.id, spam); }} onDownload={downloadOriginal} onDownloadAttachment={(attachment) => void downloadAttachment(attachment)} onReply={openReply} onForward={openForward} onRetry={() => setReaderRetryKey((key) => key + 1)} />}
     </main>
     {notice && !compose && <div className="toast" role="status">{notice}<button type="button" aria-label="Cerrar aviso" onClick={() => setNotice(null)}><X size={16} /></button></div>}
-    {compose && <ComposeDialog session={session} replyTo={compose.replyTo} archiveReply={compose.archiveReply} onClose={() => setCompose(null)} onSent={onSent} />}
+    {compose && <ComposeDialog key={`${compose.draft ? 'd' : compose.forwardOf ? 'f' : compose.replyTo ? 'r' : compose.archiveReply ? 'a' : 'n'}-${compose.draft?.id ?? compose.forwardOf?.id ?? compose.replyTo?.id ?? compose.archiveReply?.token ?? 'new'}`} session={session} replyTo={compose.replyTo} forwardOf={compose.forwardOf} archiveReply={compose.archiveReply} draft={compose.draft} onClose={closeCompose} onSent={onSent} onScheduled={onScheduled} />}
   </div>;
 }

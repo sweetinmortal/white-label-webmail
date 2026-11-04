@@ -25,12 +25,20 @@
   },
   "incomingSummary": {
     "enabled": false,
-    "batchSize": 5,
     "from": {
       "name": "Webmail de Mi Empresa",
       "email": "webmail@empresa.example"
     },
-    "timeZone": "UTC"
+    "timeZone": "UTC",
+    "schedule": {
+      "hour": 8,
+      "minute": 0,
+      "weekdaysOnly": true
+    }
+  },
+  "spamProtection": {
+    "enabled": true,
+    "blockedSenders": []
   },
   "usageAlerts": {
     "enabled": false,

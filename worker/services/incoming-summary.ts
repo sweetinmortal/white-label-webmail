@@ -1,10 +1,37 @@
 import type { Env, MailConfig } from '../types';
-import { parseJson } from '../store/schema';
 import type { ClaimedSummaryBatch, SummaryBatchStatus, SummaryItemRow } from '../store/incoming-summary';
 import { claimSummaryBatch, finalizeSummaryBatch, pendingSummaryCount, recoverStaleSummaryBatches } from '../store/incoming-summary';
-import { archiveReplyUrl, sealArchiveReply } from './archive-links';
 
 const MAX_BATCHES_PER_RUN = 10;
+// A daily summary normally contains every pending message. Keep one email
+// bounded for unusually busy days and continue with another summary if needed.
+const MAX_ITEMS_PER_SUMMARY = 100;
+const DELIVERY_WINDOW_MINUTES = 5;
+
+export function incomingSummaryDue(at: Date, config: MailConfig): boolean {
+  const summary = config.incomingSummary;
+  if (!summary?.enabled || Number.isNaN(at.getTime())) return false;
+  try {
+    const parts = new Intl.DateTimeFormat('en-US', {
+      timeZone: summary.timeZone,
+      weekday: 'short',
+      hour: '2-digit',
+      minute: '2-digit',
+      hourCycle: 'h23',
+    }).formatToParts(at);
+    const value = (type: string) => parts.find((part) => part.type === type)?.value;
+    const weekday = value('weekday');
+    const hour = Number(value('hour'));
+    const minute = Number(value('minute'));
+    if (!Number.isInteger(hour) || !Number.isInteger(minute)) return false;
+    if (summary.schedule.weekdaysOnly && (weekday === 'Sat' || weekday === 'Sun')) return false;
+    const current = hour * 60 + minute;
+    const target = summary.schedule.hour * 60 + summary.schedule.minute;
+    return current >= target && current < target + DELIVERY_WINDOW_MINUTES;
+  } catch {
+    return false;
+  }
+}
 
 export type SummarySendOutcome = Extract<SummaryBatchStatus, 'accepted' | 'failed' | 'unknown'>;
 
@@ -44,34 +71,44 @@ function formatDate(value: string, locale: string, timeZone: string): string {
   }
 }
 
+function summaryCount(count: number): string {
+  return count === 1 ? '1 correo recibido' : `${count} correos recibidos`;
+}
+
 function summarySubject(config: MailConfig, count: number): string {
-  return `Resumen de ${count} correos recibidos · ${config.brand.name}`.slice(0, 255);
+  return `Resumen de ${summaryCount(count)} · ${config.brand.name}`.slice(0, 255);
+}
+
+function summaryScheduleText(config: MailConfig): string {
+  const summary = config.incomingSummary;
+  const schedule = summary?.schedule;
+  if (!summary || !schedule) return 'Este resumen se envía automáticamente según el horario configurado.';
+  const time = `${String(schedule.hour).padStart(2, '0')}:${String(schedule.minute).padStart(2, '0')}`;
+  const days = schedule.weekdaysOnly ? 'de lunes a viernes' : 'todos los días';
+  return `Este resumen se envía automáticamente ${days} a las ${time} (${summary.timeZone}).`;
 }
 
 function cleanSubject(value: string): string {
   return value.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s+/g, ' ').trim();
 }
 
-function replySubject(value: string): string {
-  return (cleanSubject(value) || 'Correo recibido').slice(0, 251);
-}
-
-function summaryContent(config: MailConfig, items: Array<SummaryItemRow & { url: string }>): { text: string; html: string } {
+function summaryContent(config: MailConfig, items: SummaryItemRow[]): { text: string; html: string } {
   const timeZone = config.incomingSummary?.timeZone ?? 'UTC';
+  const scheduleText = summaryScheduleText(config);
   const notice = 'Responde desde el webmail para conservar la identidad institucional y el hilo del mensaje. No respondas a este resumen.';
   const text = [
-    `Resumen de ${items.length} correos recibidos en ${config.brand.name}.`,
+    `Resumen de ${summaryCount(items.length)} en ${config.brand.name}.`,
     notice,
+    `Ver webmail: ${config.appOrigin}`,
     '',
     ...items.flatMap((item, index) => [
       `${index + 1}. ${item.sender_name ? `${item.sender_name} <${item.sender_email}>` : item.sender_email}`,
       `Asunto: ${cleanSubject(item.subject) || '(sin asunto)'}`,
       `Recibido en: ${item.recipient_address}`,
       `Fecha: ${formatDate(item.received_at, config.brand.locale, timeZone)}`,
-      `Responder en el webmail: ${item.url}`,
       '',
     ]),
-    'Este resumen se genera automáticamente cada lote de correos entrantes.',
+    scheduleText,
   ].join('\n');
   const color = /^#[a-f0-9]{6}$/i.test(config.brand.primaryColor) ? config.brand.primaryColor : '#0875d1';
   const cards = items.map((item, index) => {
@@ -81,10 +118,9 @@ function summaryContent(config: MailConfig, items: Array<SummaryItemRow & { url:
       <div style="margin-top:7px;font:600 16px/1.4 Arial,sans-serif;color:#111827">${escape(cleanSubject(item.subject) || '(sin asunto)')}</div>
       <div style="margin-top:7px;font:13px/1.55 Arial,sans-serif;color:#4b5563">Recibido en: ${escape(item.recipient_address)}</div>
       <div style="font:13px/1.55 Arial,sans-serif;color:#4b5563">Fecha: ${escape(formatDate(item.received_at, config.brand.locale, timeZone))}</div>
-      <a href="${escape(item.url)}" style="display:inline-block;margin-top:12px;padding:8px 13px;border:1px solid ${color};border-radius:6px;color:${color};text-decoration:none;font:600 14px/1.2 Arial,sans-serif">Responder en el webmail</a>
     </li>`;
   }).join('');
-  const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(summarySubject(config, items.length))}</title></head><body style="margin:0;padding:0;background:#f7f8fa"><div style="max-width:760px;margin:0 auto;padding:24px 16px"><div style="padding:20px;border:1px solid #e5e7eb;border-radius:8px;background:#ffffff"><h1 style="margin:0;font:700 22px/1.3 Arial,sans-serif;color:#111827">Resumen de ${items.length} correos recibidos</h1><p style="margin:10px 0 0;font:14px/1.6 Arial,sans-serif;color:#4b5563">${escape(notice)}</p><ul style="margin:20px 0 0;padding:0">${cards}</ul><p style="margin:18px 0 0;font:12px/1.5 Arial,sans-serif;color:#6b7280">${escape(config.brand.name)} · Este resumen se genera automáticamente cada lote de correos entrantes.</p></div></div></body></html>`;
+  const html = `<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${escape(summarySubject(config, items.length))}</title></head><body style="margin:0;padding:0;background:#f7f8fa"><div style="max-width:760px;margin:0 auto;padding:24px 16px"><div style="padding:20px;border:1px solid #e5e7eb;border-radius:8px;background:#ffffff"><h1 style="margin:0;font:700 22px/1.3 Arial,sans-serif;color:#111827">Resumen de ${summaryCount(items.length)}</h1><p style="margin:10px 0 0;font:14px/1.6 Arial,sans-serif;color:#4b5563">${escape(notice)}</p><p style="margin:16px 0 0"><a href="${escape(config.appOrigin)}" style="display:inline-block;padding:11px 18px;border-radius:6px;background:${color};color:#ffffff;text-decoration:none;font:700 15px/1.2 Arial,sans-serif">Ver webmail</a></p><ul style="margin:20px 0 0;padding:0">${cards}</ul><p style="margin:18px 0 0;font:12px/1.5 Arial,sans-serif;color:#6b7280">${escape(config.brand.name)} · ${escape(scheduleText)}</p></div></div></body></html>`;
   return { text, html };
 }
 
@@ -92,23 +128,7 @@ export async function sendSummaryBatch(env: Env, config: MailConfig, claimed: Cl
   const summary = config.incomingSummary;
   if (!summary?.enabled || !summary.from) return { outcome: 'failed', code: 'summary_not_configured' };
   if (!env.ARCHIVE_EMAIL_COPY) return { outcome: 'unknown', code: 'binding_missing' };
-  const items: Array<SummaryItemRow & { url: string }> = [];
-  try {
-    for (const item of claimed.items) {
-      const token = await sealArchiveReply(env, config, {
-        direction: 'incoming',
-        from: item.reply_from,
-        to: parseJson<string[]>(item.reply_to_json, []).filter((email) => typeof email === 'string').slice(0, 10),
-        cc: [],
-        subject: replySubject(item.subject),
-        ...(item.in_reply_to ? { inReplyTo: item.in_reply_to } : {}),
-        references: parseJson<string[]>(item.references_json, []).slice(0, 5),
-      });
-      items.push({ ...item, url: archiveReplyUrl(config, token) });
-    }
-  } catch {
-    return { outcome: 'failed', code: 'link_unavailable' };
-  }
+  const items: SummaryItemRow[] = claimed.items;
   const content = summaryContent(config, items);
   try {
     const result = await env.ARCHIVE_EMAIL_COPY.send({
@@ -134,12 +154,12 @@ export async function flushIncomingSummaries(env: Env, config: MailConfig): Prom
   if (!summary?.enabled) return { status: 'disabled', sent: 0, pending: 0 };
   if (!env.ARCHIVE_EMAIL_COPY) return { status: 'deferred', sent: 0, pending: await pendingSummaryCount(env.DB, config.mailbox.id), code: 'binding_missing' };
   try { await recoverStaleSummaryBatches(env.DB, config.mailbox.id); }
-  catch { /* A recovery sweep must not prevent a new complete batch from sending. */ }
+  catch { /* A recovery sweep must not prevent a new daily summary from sending. */ }
   let sent = 0;
   for (let attempt = 0; attempt < MAX_BATCHES_PER_RUN; attempt += 1) {
     const pending = await pendingSummaryCount(env.DB, config.mailbox.id);
-    if (pending < summary.batchSize) return { status: sent ? 'sent' : 'idle', sent, pending };
-    const claimed = await claimSummaryBatch(env.DB, config.mailbox.id, summary.batchSize);
+    if (pending < 1) return { status: sent ? 'sent' : 'idle', sent, pending };
+    const claimed = await claimSummaryBatch(env.DB, config.mailbox.id, Math.min(pending, MAX_ITEMS_PER_SUMMARY));
     if (!claimed) return { status: sent ? 'sent' : 'idle', sent, pending: await pendingSummaryCount(env.DB, config.mailbox.id) };
     let result: SummarySendResult;
     try { result = await sendSummaryBatch(env, config, claimed); }

@@ -71,7 +71,11 @@ export async function parseEmailContent(buffer: ArrayBuffer): Promise<ParsedEmai
   const message = await parser.parse(buffer) as PostalMessage;
   const rawHtml = Array.isArray(message.html) ? message.html.join('\n') : message.html;
   const sanitized = rawHtml ? sanitizeEmailHtml(rawHtml) : { html: '', styles: '', remoteImages: 0 };
-  const bodyText = message.text?.trim() || (rawHtml ? htmlToText(rawHtml) : '');
+  // Some senders provide a generic text/plain warning while the real message
+  // is in the HTML part. Prefer readable HTML text, but keep a legitimate
+  // plain-text part when the HTML contains no text (for example, only images).
+  const htmlText = rawHtml ? htmlToText(rawHtml) : '';
+  const bodyText = htmlText || (message.text?.trim() ?? '');
   const attachments: ParsedEmailAttachment[] = [];
   for (const attachment of message.attachments ?? []) {
     if (!attachment.content) continue;

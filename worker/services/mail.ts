@@ -1,6 +1,7 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import { addressParser, decodeWords } from 'postal-mime';
-import type { Address, AttachmentInfo, Folder, MessageDetail, MessagePage, MessageSummary, OutgoingAttachment, SendInput, SendResult, SendStatus, ArchiveStatus } from '../../shared/contracts';
+import { decodeHTML } from 'entities';
+import type { Address, AttachmentInfo, DraftDetail, DraftInput, DraftSummary, Folder, MessageDetail, MessagePage, MessageSummary, OutgoingAttachment, SendInput, SendResult, SendStatus, ArchiveStatus } from '../../shared/contracts';
 import { base64ByteLength, isMimeType, normalizeBase64, sanitizeAttachmentFilename } from '../../shared/attachments';
 import { AppError } from '../errors';
 import { mailIdentities } from '../config';
@@ -11,11 +12,13 @@ import type { OutboundMessage, OutboundProvider, OutboundRecipient, ProviderResu
 import { addDaysIso, ensureSchema, isUniqueConstraint, json, nowIso, parseJson } from '../store/schema';
 import { deleteObject, getObject, getStorageUsage, pauseStorage, putJson, putStream, releaseStorage, reserveStorage } from '../store/storage';
 import { releaseRecipients, reserveRecipients } from '../store/quota';
-import { addTombstone, claimOutbox, findIdempotency, insertOutbox, setOutboxStatus, updateRecipientResults } from '../store/outbox';
+import { addTombstone, claimDueOutbox, claimOutbox, findIdempotency, insertOutbox, listDueOutbox, recoverStaleScheduledOutbox, setOutboxStatus, updateRecipientResults } from '../store/outbox';
 import { getMailStore } from '../store/objects';
 import { archiveMessageId, archiveReferences, assertArchiveLinkKey, openArchiveReply, sealArchiveReply } from './archive-links';
 import { cleanupSummaryState, enqueueSummaryItem } from '../store/incoming-summary';
-import { flushIncomingSummaries } from './incoming-summary';
+import { matchIncomingFilter } from './incoming-filters';
+import { renderReplyHtml } from './reply-html';
+import { classifyIncomingSpam } from './spam';
 
 const MAX_CURSOR_BYTES = 512;
 const MAX_PAGE = 30;
@@ -23,8 +26,13 @@ const MAX_IDEMPOTENCY_KEY = 256;
 const MAX_ADDRESS_HEADER = 8192;
 const MAX_DECODED_HEADER = 4096;
 const MAX_DISPLAY_NAME = 200;
+const MAX_DRAFTS = 100;
+const MAX_DRAFT_BYTES = 25 * 1024 * 1024;
+const DRAFT_ID_RE = /^[a-zA-Z0-9_-]{8,128}$/;
 const EMAIL_RE = /^[^\s@<>;,]+@[^\s@<>;,]+\.[^\s@<>;,]+$/;
 const SAFE_HEADER_NAMES = new Set(['in-reply-to', 'references']);
+const MIN_SCHEDULE_LEAD_MS = 60_000;
+const MAX_SCHEDULE_LEAD_MS = 366 * 86_400_000;
 
 interface MessageRow {
   id: string;
@@ -53,9 +61,31 @@ interface MessageRow {
   send_status: SendStatus | null;
   delete_state: string;
   is_read?: number;
+  filter_label?: string | null;
+  filter_rule_id?: string | null;
+  is_spam?: number | null;
+  spam_reason?: string | null;
   idempotency_key?: string | null;
   payload_hash?: string | null;
   outbox_status?: SendStatus | null;
+}
+
+interface DraftRow {
+  id: string;
+  mailbox_id: string;
+  user_email: string;
+  from_address: string;
+  to_text: string;
+  cc_text: string;
+  bcc_text: string;
+  subject: string;
+  preview: string;
+  payload_key: string;
+  payload_bytes: number;
+  attachment_count: number;
+  attachment_bytes: number;
+  created_at: string;
+  updated_at: string;
 }
 
 interface Cursor { createdAt: string; id: string }
@@ -96,8 +126,11 @@ function validateConfig(config: MailConfig): void {
   }
   if (config.incomingSummary) {
     const summary = config.incomingSummary;
-    if (!Number.isSafeInteger(summary.batchSize) || summary.batchSize < 1 || summary.batchSize > 50) {
-      throw new AppError(500, 'summary_misconfigured', 'El tamaño del resumen no está configurado correctamente.');
+    const schedule = summary.schedule;
+    if (!schedule || !Number.isSafeInteger(schedule.hour) || schedule.hour < 0 || schedule.hour > 23 ||
+        !Number.isSafeInteger(schedule.minute) || schedule.minute < 0 || schedule.minute > 59 ||
+        typeof schedule.weekdaysOnly !== 'boolean') {
+      throw new AppError(500, 'summary_misconfigured', 'El horario del resumen no está configurado correctamente.');
     }
     if (summary.enabled && (!summary.from || !EMAIL_RE.test(normalizeEmail(summary.from.email)))) {
       throw new AppError(500, 'summary_misconfigured', 'El remitente del resumen no está configurado correctamente.');
@@ -117,7 +150,7 @@ async function incomingDedupeKey(recipient: string, rfcMessageId: string | undef
 function decodeHeaderValue(value: string, max = MAX_DECODED_HEADER): string {
   const bounded = value.replace(/[\r\n]/g, ' ').trim().slice(0, max);
   try {
-    return decodeWords(bounded).replace(/[\r\n]/g, ' ').trim().slice(0, max);
+    return decodeHTML(decodeWords(bounded)).replace(/[\r\n]/g, ' ').trim().slice(0, max);
   } catch {
     return bounded;
   }
@@ -225,12 +258,15 @@ function rowToSummary(row: MessageRow, config: MailConfig, isRead = row.is_read 
     from: { email: row.from_email, ...(row.from_name ? { name: row.from_name } : {}) },
     to: parseJson<Address[]>(row.to_json, []),
     cc: parseJson<Address[]>(row.cc_json, []),
-    subject: row.subject,
+    subject: decodeHTML(row.subject),
     createdAt: row.created_at,
     sizeBytes: Number(row.size_bytes || 0),
     isRead: row.direction === 'outgoing' ? true : isRead,
     archiveStatus: row.archive_status,
     ...(row.send_status ? { sendStatus: row.send_status } : {}),
+    ...(row.filter_label ? { filterLabel: row.filter_label } : {}),
+    isSpam: row.direction === 'incoming' && row.is_spam === 1,
+    ...(row.is_spam === 1 && row.spam_reason ? { spamReason: row.spam_reason } : {}),
   };
 }
 
@@ -276,7 +312,22 @@ async function outgoingSnapshot(env: Env, config: MailConfig, row: MessageRow): 
   return { bodyText: payload.text, attachments, rawAttachments };
 }
 
-function canonicalPayload(input: { from: string; to: string[]; cc: string[]; bcc: string[]; subject: string; text: string; attachments: OutgoingAttachment[]; replyToMessageId?: string; archiveReplyToken?: string }): string {
+function normalizeScheduledAt(value: unknown): string | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  if (typeof value !== 'string' || value.length > 40) {
+    throw new AppError(400, 'schedule_invalid', 'La fecha de programación no es válida.');
+  }
+  const at = new Date(value);
+  if (Number.isNaN(at.getTime()) || at.getTime() < Date.now() + MIN_SCHEDULE_LEAD_MS) {
+    throw new AppError(400, 'schedule_invalid', 'Programa el envío para dentro de al menos un minuto.');
+  }
+  if (at.getTime() > Date.now() + MAX_SCHEDULE_LEAD_MS) {
+    throw new AppError(400, 'schedule_invalid', 'No se puede programar un envío con más de un año de anticipación.');
+  }
+  return at.toISOString();
+}
+
+function canonicalPayload(input: { from: string; to: string[]; cc: string[]; bcc: string[]; subject: string; text: string; attachments: OutgoingAttachment[]; replyToMessageId?: string; archiveReplyToken?: string; draftId?: string; scheduledAt?: string }): string {
   return JSON.stringify({
     from: normalizeEmail(input.from),
     to: input.to.map(normalizeEmail).sort(),
@@ -291,6 +342,8 @@ function canonicalPayload(input: { from: string; to: string[]; cc: string[]; bcc
     })),
     replyToMessageId: input.replyToMessageId ?? null,
     ...(input.archiveReplyToken ? { archiveReplyToken: input.archiveReplyToken } : {}),
+    draftId: input.draftId ?? null,
+    scheduledAt: input.scheduledAt ?? null,
   });
 }
 
@@ -302,7 +355,7 @@ async function sha256(value: string): Promise<string> {
 async function getRow(db: D1Database, identity: Identity, config: MailConfig, messageId: string): Promise<MessageRow> {
   assertMailbox(identity, config);
   await ensureSchema(db);
-  const row = await db.prepare(`SELECT m.*, CASE WHEN m.direction = 'outgoing' THEN 1 ELSE CASE WHEN r.message_id IS NULL THEN 0 ELSE 1 END END AS is_read, a.address AS identity_address FROM mail_messages m LEFT JOIN mail_read_states r ON r.message_id = m.id AND r.user_email = ? LEFT JOIN mail_message_identities a ON a.message_id = m.id WHERE m.id = ? AND m.mailbox_id = ? AND m.delete_state <> 'deleted'`)
+  const row = await db.prepare(`SELECT m.*, s.is_spam AS is_spam, s.reason AS spam_reason, f.label AS filter_label, f.rule_id AS filter_rule_id, CASE WHEN m.direction = 'outgoing' THEN 1 ELSE CASE WHEN r.message_id IS NULL THEN 0 ELSE 1 END END AS is_read, a.address AS identity_address FROM mail_messages m LEFT JOIN mail_read_states r ON r.message_id = m.id AND r.user_email = ? LEFT JOIN mail_message_identities a ON a.message_id = m.id LEFT JOIN mail_message_filters f ON f.message_id = m.id LEFT JOIN mail_message_spam s ON s.message_id = m.id AND s.mailbox_id = m.mailbox_id WHERE m.id = ? AND m.mailbox_id = ? AND m.delete_state <> 'deleted'`)
     .bind(normalizeEmail(identity.email), messageId, config.mailbox.id).first<MessageRow>();
   if (!row) throw new AppError(404, 'message_not_found', 'El mensaje no existe en este buzón.');
   return row;
@@ -415,27 +468,36 @@ async function persistProviderResult(db: D1Database, messageId: string, result: 
   await setOutboxStatus(db, messageId, providerResultStatus(result), result.code);
 }
 
-export async function listMessages(env: Env, config: MailConfig, identity: Identity, folder: Folder, cursor?: string, unreadOnly = false, address?: string): Promise<MessagePage> {
+export async function listMessages(env: Env, config: MailConfig, identity: Identity, folder: Folder, cursor?: string, unreadOnly = false, address?: string, label?: string): Promise<MessagePage> {
   validateConfig(config);
   assertMailbox(identity, config);
-  if (folder !== 'inbox' && folder !== 'sent') throw new AppError(400, 'folder_invalid', 'La carpeta solicitada no es válida.');
+  if (folder !== 'inbox' && folder !== 'sent' && folder !== 'filtered' && folder !== 'all' && folder !== 'spam') throw new AppError(400, 'folder_invalid', 'La carpeta solicitada no es válida.');
+  if (label !== undefined && (folder !== 'all' || !label.trim() || label.length > 160)) throw new AppError(400, 'label_invalid', 'La etiqueta solicitada no es válida.');
   await ensureSchema(env.DB);
-  const direction = folder === 'inbox' ? 'incoming' : 'outgoing';
   const decoded = decodeCursor(cursor);
   const limit = MAX_PAGE;
-  const conditions = ['m.mailbox_id = ?', 'm.direction = ?', "m.delete_state = 'active'"];
-  const values: unknown[] = [config.mailbox.id, direction];
+  const conditions = ['m.mailbox_id = ?', "m.delete_state = 'active'"];
+  const values: unknown[] = [config.mailbox.id];
+  if (folder === 'sent') conditions.push("m.direction = 'outgoing'");
+  else if (folder !== 'all') conditions.push("m.direction = 'incoming'");
+  if (folder === 'inbox') conditions.push('f.message_id IS NULL');
+  if (folder === 'filtered') conditions.push('f.message_id IS NOT NULL');
+  conditions.push(folder === 'spam' ? 's.is_spam = 1' : 'COALESCE(s.is_spam, 0) = 0');
+  if (label !== undefined) {
+    conditions.push("m.direction = 'incoming'", 'f.label = ?');
+    values.push(label.trim());
+  }
   if (address !== undefined) {
     const selected = resolveSender(config, address);
     conditions.push("COALESCE(a.address, CASE WHEN m.direction = 'outgoing' THEN m.from_email ELSE ? END) = ?");
     values.push(config.mailbox.address, selected.email);
   }
-  if (unreadOnly) { conditions.push('r.message_id IS NULL'); }
+  if (unreadOnly) conditions.push(folder === 'all' ? "(m.direction = 'outgoing' OR r.message_id IS NULL)" : 'r.message_id IS NULL');
   if (decoded) {
     conditions.push('(m.created_at < ? OR (m.created_at = ? AND m.id < ?))');
     values.push(decoded.createdAt, decoded.createdAt, decoded.id);
   }
-  const query = `SELECT m.*, CASE WHEN m.direction = 'outgoing' THEN 1 ELSE CASE WHEN r.message_id IS NULL THEN 0 ELSE 1 END END AS is_read, a.address AS identity_address FROM mail_messages m LEFT JOIN mail_read_states r ON r.message_id = m.id AND r.user_email = ? LEFT JOIN mail_message_identities a ON a.message_id = m.id WHERE ${conditions.join(' AND ')} ORDER BY m.created_at DESC, m.id DESC LIMIT ?`;
+  const query = `SELECT m.*, s.is_spam AS is_spam, s.reason AS spam_reason, f.label AS filter_label, f.rule_id AS filter_rule_id, CASE WHEN m.direction = 'outgoing' THEN 1 ELSE CASE WHEN r.message_id IS NULL THEN 0 ELSE 1 END END AS is_read, a.address AS identity_address FROM mail_messages m LEFT JOIN mail_read_states r ON r.message_id = m.id AND r.user_email = ? LEFT JOIN mail_message_identities a ON a.message_id = m.id LEFT JOIN mail_message_filters f ON f.message_id = m.id LEFT JOIN mail_message_spam s ON s.message_id = m.id AND s.mailbox_id = m.mailbox_id WHERE ${conditions.join(' AND ')} ORDER BY m.created_at DESC, m.id DESC LIMIT ?`;
   const result = await env.DB.prepare(query).bind(normalizeEmail(identity.email), ...values, limit + 1).all<MessageRow>();
   const rows = result.results ?? [];
   const pageRows = rows.slice(0, limit);
@@ -499,6 +561,174 @@ export async function getRaw(env: Env, config: MailConfig, identity: Identity, m
   return new Response(JSON.stringify(payload), { headers: { 'Content-Type': 'application/json; charset=utf-8', 'Content-Disposition': `attachment; filename="${messageId}.json"`, 'Cache-Control': 'no-store' } });
 }
 
+function validDraftId(value: unknown): value is string {
+  return typeof value === 'string' && DRAFT_ID_RE.test(value);
+}
+
+function draftLine(value: unknown, max: number, fallback = ''): string {
+  if (value === undefined || value === null) return fallback;
+  if (typeof value !== 'string') throw new AppError(400, 'draft_invalid', 'El borrador no es válido.');
+  return value.replace(/[\r\n]+/g, ' ').slice(0, max);
+}
+
+function draftPreview(text: string): string {
+  const normalized = text.replace(/\r\n/g, '\n');
+  const header = normalized.search(/\n(?:El .+ escribió:|On .+ wrote:|-{2,}\s*(?:Original Message|Mensaje original)\s*-{2,})/i);
+  const visible = (header > 0 ? normalized.slice(0, header) : normalized).replace(/\s+/g, ' ').trim();
+  return visible.slice(0, 160);
+}
+
+async function draftPayloadKey(mailboxId: string, userEmail: string, draftId: string): Promise<string> {
+  const owner = (await sha256(`${mailboxId}\n${normalizeEmail(userEmail)}`)).slice(0, 32);
+  return `drafts/${mailboxId}/${owner}/${draftId}.json`;
+}
+
+function draftRowToSummary(row: DraftRow): DraftSummary {
+  return {
+    id: row.id,
+    from: row.from_address,
+    to: row.to_text,
+    subject: row.subject,
+    preview: row.preview,
+    attachmentCount: Number(row.attachment_count || 0),
+    attachmentBytes: Number(row.attachment_bytes || 0),
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+  };
+}
+
+export async function listDrafts(env: Env, config: MailConfig, identity: Identity): Promise<DraftSummary[]> {
+  validateConfig(config);
+  assertMailbox(identity, config);
+  await ensureSchema(env.DB);
+  const result = await env.DB.prepare(`SELECT id, mailbox_id, user_email, from_address, to_text, cc_text, bcc_text, subject, preview, payload_key, payload_bytes, attachment_count, attachment_bytes, created_at, updated_at FROM mail_drafts WHERE mailbox_id = ? AND user_email = ? ORDER BY updated_at DESC, id DESC LIMIT ?`)
+    .bind(config.mailbox.id, normalizeEmail(identity.email), MAX_DRAFTS).all<DraftRow>();
+  return (result.results ?? []).map(draftRowToSummary);
+}
+
+export async function getDraft(env: Env, config: MailConfig, identity: Identity, draftId: string): Promise<DraftDetail> {
+  validateConfig(config);
+  assertMailbox(identity, config);
+  if (!validDraftId(draftId)) throw new AppError(400, 'draft_invalid', 'El borrador no es válido.');
+  await ensureSchema(env.DB);
+  const row = await env.DB.prepare(`SELECT id, mailbox_id, user_email, from_address, to_text, cc_text, bcc_text, subject, preview, payload_key, payload_bytes, attachment_count, attachment_bytes, created_at, updated_at FROM mail_drafts WHERE id = ? AND mailbox_id = ? AND user_email = ?`)
+    .bind(draftId, config.mailbox.id, normalizeEmail(identity.email)).first<DraftRow>();
+  if (!row) throw new AppError(404, 'draft_not_found', 'El borrador no existe.');
+  let object: { body: unknown; text(): Promise<string> };
+  try {
+    object = await getObject(getMailStore(env, config), row.payload_key);
+  } catch (error) {
+    if (error instanceof AppError && error.code === 'raw_not_found') {
+      throw new AppError(404, 'draft_not_found', 'El contenido del borrador ya no está disponible.');
+    }
+    throw error;
+  }
+  const payload = parseJson<Record<string, unknown> | null>(await object.text(), null);
+  if (!payload || typeof payload.text !== 'string' || typeof payload.to !== 'string' || typeof payload.subject !== 'string') {
+    throw new AppError(500, 'draft_payload_invalid', 'El borrador no se pudo leer.');
+  }
+  const attachments: OutgoingAttachment[] = [];
+  if (Array.isArray(payload.attachments)) {
+    for (const entry of payload.attachments.slice(0, config.maxAttachments)) {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) continue;
+      const candidate = entry as Record<string, unknown>;
+      if (typeof candidate.filename !== 'string' || typeof candidate.mimeType !== 'string' || typeof candidate.contentBase64 !== 'string') continue;
+      const base64 = normalizeBase64(candidate.contentBase64);
+      if (!base64 || !isMimeType(candidate.mimeType)) continue;
+      attachments.push({ filename: sanitizeAttachmentFilename(candidate.filename), mimeType: candidate.mimeType.toLowerCase(), contentBase64: base64 });
+    }
+  }
+  return {
+    ...draftRowToSummary(row),
+    from: typeof payload.from === 'string' ? payload.from : row.from_address,
+    to: typeof payload.to === 'string' ? payload.to : row.to_text,
+    cc: typeof payload.cc === 'string' ? payload.cc : row.cc_text,
+    bcc: typeof payload.bcc === 'string' ? payload.bcc : row.bcc_text,
+    subject: typeof payload.subject === 'string' ? payload.subject : row.subject,
+    text: payload.text,
+    attachments,
+    ...(typeof payload.replyToMessageId === 'string' ? { replyToMessageId: payload.replyToMessageId } : {}),
+    ...(typeof payload.archiveReplyToken === 'string' ? { archiveReplyToken: payload.archiveReplyToken } : {}),
+  };
+}
+
+export async function saveDraft(env: Env, config: MailConfig, identity: Identity, draftId: string, input: DraftInput): Promise<DraftDetail> {
+  validateConfig(config);
+  assertMailbox(identity, config);
+  if (!validDraftId(draftId)) throw new AppError(400, 'draft_invalid', 'El borrador no es válido.');
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new AppError(400, 'draft_invalid', 'El borrador no es válido.');
+  const user = normalizeEmail(identity.email);
+  const from = draftLine(input.from, 254, config.mailbox.address) || config.mailbox.address;
+  const to = draftLine(input.to, MAX_ADDRESS_HEADER);
+  const cc = draftLine(input.cc, MAX_ADDRESS_HEADER);
+  const bcc = draftLine(input.bcc, MAX_ADDRESS_HEADER);
+  const subject = draftLine(input.subject, 998);
+  if (typeof input.text !== 'string') throw new AppError(400, 'draft_invalid', 'El texto del borrador no es válido.');
+  if (new TextEncoder().encode(input.text).byteLength > config.maxComposeBytes) {
+    throw new AppError(413, 'draft_too_large', 'El borrador supera el tamaño permitido.');
+  }
+  if (input.replyToMessageId !== undefined && !validDraftId(input.replyToMessageId)) {
+    throw new AppError(400, 'draft_invalid', 'El mensaje original del borrador no es válido.');
+  }
+  if (input.archiveReplyToken !== undefined && (typeof input.archiveReplyToken !== 'string' || input.archiveReplyToken.length > 8192 || input.replyToMessageId)) {
+    throw new AppError(400, 'draft_invalid', 'El enlace de respuesta del borrador no es válido.');
+  }
+  const attachments = normalizeAttachments(input.attachments, config);
+  const payloadAttachments = attachments.map(({ filename, mimeType, contentBase64 }) => ({ filename, mimeType, contentBase64 }));
+  const attachmentBytes = attachments.reduce((total, attachment) => total + attachment.sizeBytes, 0);
+  const payload = {
+    from, to, cc, bcc, subject, text: input.text, attachments: payloadAttachments,
+    ...(input.replyToMessageId ? { replyToMessageId: input.replyToMessageId } : {}),
+    ...(input.archiveReplyToken ? { archiveReplyToken: input.archiveReplyToken } : {}),
+  };
+  const payloadBytes = new TextEncoder().encode(JSON.stringify(payload)).byteLength;
+  if (payloadBytes > MAX_DRAFT_BYTES) throw new AppError(413, 'draft_too_large', 'El borrador supera el tamaño permitido.');
+  await ensureSchema(env.DB);
+  const existing = await env.DB.prepare(`SELECT id, mailbox_id, user_email, from_address, to_text, cc_text, bcc_text, subject, preview, payload_key, payload_bytes, attachment_count, attachment_bytes, created_at, updated_at FROM mail_drafts WHERE id = ? AND mailbox_id = ?`)
+    .bind(draftId, config.mailbox.id).first<DraftRow>();
+  if (existing && existing.user_email !== user) throw new AppError(409, 'draft_conflict', 'El borrador no está disponible.');
+  const usage = await env.DB.prepare(`SELECT COUNT(*) AS count, COALESCE(SUM(payload_bytes), 0) AS bytes FROM mail_drafts WHERE mailbox_id = ? AND user_email = ?`)
+    .bind(config.mailbox.id, user).first<{ count: number; bytes: number }>();
+  const count = Number(usage?.count ?? 0);
+  const usedBytes = Number(usage?.bytes ?? 0);
+  if (!existing && count >= MAX_DRAFTS) throw new AppError(429, 'draft_limit', 'Tienes demasiados borradores. Descarta uno antes de guardar otro.');
+  const projectedBytes = usedBytes - Number(existing?.payload_bytes ?? 0) + payloadBytes;
+  if (projectedBytes > MAX_DRAFT_BYTES) throw new AppError(413, 'draft_quota', 'Los borradores superan el espacio disponible.');
+  const payloadKey = existing?.payload_key ?? await draftPayloadKey(config.mailbox.id, user, draftId);
+  const storedBytes = await putJson(getMailStore(env, config), payloadKey, payload);
+  const at = nowIso();
+  const createdAt = existing?.created_at ?? at;
+  const preview = draftPreview(input.text);
+  await env.DB.prepare(`INSERT INTO mail_drafts (id, mailbox_id, user_email, from_address, to_text, cc_text, bcc_text, subject, preview, payload_key, payload_bytes, attachment_count, attachment_bytes, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET from_address = excluded.from_address, to_text = excluded.to_text, cc_text = excluded.cc_text, bcc_text = excluded.bcc_text, subject = excluded.subject, preview = excluded.preview, payload_key = excluded.payload_key, payload_bytes = excluded.payload_bytes, attachment_count = excluded.attachment_count, attachment_bytes = excluded.attachment_bytes, updated_at = excluded.updated_at`)
+    .bind(draftId, config.mailbox.id, user, from, to, cc, bcc, subject, preview, payloadKey, storedBytes, attachments.length, attachmentBytes, createdAt, at).run();
+  return {
+    id: draftId, from, to, cc, bcc, subject, text: input.text, attachments: payloadAttachments,
+    preview, attachmentCount: attachments.length, attachmentBytes, createdAt, updatedAt: at,
+    ...(input.replyToMessageId ? { replyToMessageId: input.replyToMessageId } : {}),
+    ...(input.archiveReplyToken ? { archiveReplyToken: input.archiveReplyToken } : {}),
+  };
+}
+
+export async function deleteDraft(env: Env, config: MailConfig, identity: Identity, draftId: string): Promise<void> {
+  validateConfig(config);
+  assertMailbox(identity, config);
+  if (!validDraftId(draftId)) throw new AppError(400, 'draft_invalid', 'El borrador no es válido.');
+  await ensureSchema(env.DB);
+  const row = await env.DB.prepare(`SELECT id, payload_key FROM mail_drafts WHERE id = ? AND mailbox_id = ? AND user_email = ?`)
+    .bind(draftId, config.mailbox.id, normalizeEmail(identity.email)).first<{ id: string; payload_key: string }>();
+  if (!row) return;
+  try { await deleteObject(getMailStore(env, config), row.payload_key); } catch { /* the D1 row is still removed */ }
+  await env.DB.prepare(`DELETE FROM mail_drafts WHERE id = ? AND mailbox_id = ? AND user_email = ?`)
+    .bind(draftId, config.mailbox.id, normalizeEmail(identity.email)).run();
+}
+
+export async function setSpam(env: Env, config: MailConfig, identity: Identity, messageId: string, spam: boolean): Promise<void> {
+  const row = await getRow(env.DB, identity, config, messageId);
+  if (row.direction !== 'incoming') throw new AppError(400, 'spam_incoming_only', 'Solo puedes clasificar mensajes recibidos.');
+  await env.DB.prepare(`INSERT INTO mail_message_spam (message_id, mailbox_id, is_spam, reason, source, updated_at) VALUES (?, ?, ?, ?, 'manual', ?) ON CONFLICT(message_id) DO UPDATE SET is_spam = excluded.is_spam, reason = excluded.reason, source = excluded.source, updated_at = excluded.updated_at WHERE mail_message_spam.mailbox_id = excluded.mailbox_id`)
+    .bind(messageId, config.mailbox.id, spam ? 1 : 0, spam ? 'Marcado como spam por un usuario autorizado.' : 'Restaurado por un usuario autorizado.', nowIso()).run();
+}
+
 export async function setRead(env: Env, config: MailConfig, identity: Identity, messageId: string, read: boolean): Promise<void> {
   const row = await getRow(env.DB, identity, config, messageId);
   if (row.direction !== 'incoming') return;
@@ -519,6 +749,8 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
   if (!input || typeof input !== 'object' || typeof input.subject !== 'string' || typeof input.text !== 'string') throw new AppError(400, 'message_invalid', 'El mensaje no es válido.');
   if (input.subject.length > 255 || /[\r\n]/.test(input.subject)) throw new AppError(400, 'subject_invalid', 'El asunto no es válido.');
   if (input.archiveReplyToken !== undefined && (typeof input.archiveReplyToken !== 'string' || input.archiveReplyToken.length > 8192 || input.replyToMessageId)) throw new AppError(400, 'reply_invalid', 'El enlace de respuesta no es válido.');
+  if (input.draftId !== undefined && !validDraftId(input.draftId)) throw new AppError(400, 'draft_invalid', 'El borrador no es válido.');
+  const scheduledAt = normalizeScheduledAt(input.scheduledAt);
   await ensureSchema(env.DB);
   const to = validateAddressList(input.to, 'to');
   const cc = validateAddressList(input.cc, 'cc');
@@ -550,12 +782,15 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
     'In-Reply-To': archivedReply.inReplyTo,
     References: archiveReferences([...archivedReply.references, archivedReply.inReplyTo]).join(' '),
   } : {};
-  const canonical = canonicalPayload({ from: address.email, to, cc, bcc, subject: input.subject, text: input.text, attachments, replyToMessageId: input.replyToMessageId, archiveReplyToken: input.archiveReplyToken });
+  const canonical = canonicalPayload({ from: address.email, to, cc, bcc, subject: input.subject, text: input.text, attachments, replyToMessageId: input.replyToMessageId, archiveReplyToken: input.archiveReplyToken, draftId: input.draftId, scheduledAt });
   const payloadHash = await sha256(canonical);
   const existing = await findIdempotency(env.DB, config.mailbox.id, idempotencyKey);
   if (existing) {
     if (existing.payload_hash !== payloadHash) throw new AppError(409, 'idempotency_mismatch', 'La clave de idempotencia se usó con otro mensaje.');
-    return { id: existing.id, status: existing.status, reused: true };
+    if (existing.status === 'accepted' && input.draftId) {
+      try { await deleteDraft(env, config, identity, input.draftId); } catch { /* sending remains authoritative */ }
+    }
+    return { id: existing.id, status: existing.status, reused: true, ...(existing.scheduled_at ? { scheduledAt: existing.scheduled_at } : {}) };
   }
   const archiveReplyToken = config.archiveCopies?.enabled ? await sealArchiveReply(env, config, {
     direction: 'outgoing', from: address.email, to, cc,
@@ -583,19 +818,19 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
     try { await pauseStorage(env.DB, config.mailbox.id, config.storageBudgetBytes); } catch { /* best-effort operational marker */ }
     throw new AppError(507, 'storage_quota', 'La caché temporal alcanzó su capacidad.');
   }
-  const messageSql = env.DB.prepare(`INSERT INTO mail_messages (id, mailbox_id, direction, from_email, from_name, to_json, cc_json, subject, reply_to_json, rfc_message_id, references_json, body_text, payload_key, size_bytes, created_at, sent_at, expires_at, archive_address, archive_status, send_status) VALUES (?, ?, 'outgoing', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'pending')`)
+  const messageSql = env.DB.prepare(`INSERT INTO mail_messages (id, mailbox_id, direction, from_email, from_name, to_json, cc_json, subject, reply_to_json, rfc_message_id, references_json, body_text, payload_key, size_bytes, created_at, sent_at, expires_at, archive_address, archive_status, send_status) VALUES (?, ?, 'outgoing', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)`)
     // Mailjet assigns the final transport Message-ID.  Never invent or send
     // one here; only preserve RFC identifiers received from the original.
-    .bind(messageId, config.mailbox.id, address.email, address.name ?? '', json(to.map((email) => ({ email }))), json(cc.map((email) => ({ email }))), input.subject, original ? original.reply_to_json ?? json({ email: original.from_email, name: original.from_name }) : null, null, json(original ? [...parseJson<string[]>(original.references_json, []), original.rfc_message_id].filter(Boolean) : archivedReply ? archiveReferences([...archivedReply.references, archivedReply.inReplyTo || '']) : []), null, payloadKey, payloadBytes, at, at, expiresAt, archive);
+    .bind(messageId, config.mailbox.id, address.email, address.name ?? '', json(to.map((email) => ({ email }))), json(cc.map((email) => ({ email }))), input.subject, original ? original.reply_to_json ?? json({ email: original.from_email, name: original.from_name }) : null, null, json(original ? [...parseJson<string[]>(original.references_json, []), original.rfc_message_id].filter(Boolean) : archivedReply ? archiveReferences([...archivedReply.references, archivedReply.inReplyTo || '']) : []), null, payloadKey, payloadBytes, at, scheduledAt ? null : at, expiresAt, archive, scheduledAt ? 'scheduled' : 'pending');
   const recipientSql = recipients.map((recipient) => env.DB.prepare(`INSERT INTO mail_outbox_recipients (outbox_id, email, kind, updated_at) VALUES (?, ?, ?, ?)`).bind(messageId, recipient.email, recipient.kind, at));
   try {
-    await insertOutbox(env.DB, { id: messageId, mailboxId: config.mailbox.id, key: idempotencyKey, hash: payloadHash, payloadKey, provider: config.provider, correlationId: messageId, messageSql, recipientStatements: recipientSql });
+    await insertOutbox(env.DB, { id: messageId, mailboxId: config.mailbox.id, key: idempotencyKey, hash: payloadHash, payloadKey, provider: config.provider, correlationId: messageId, ...(scheduledAt ? { scheduledAt } : {}), messageSql, recipientStatements: recipientSql });
   } catch (error) {
     await releaseStorage(env.DB, config.mailbox.id, payloadBytes);
     await releaseRecipients(env.DB, config.mailbox.id, count);
     if (error instanceof AppError && error.code === 'idempotency_conflict') {
       const raced = await findIdempotency(env.DB, config.mailbox.id, idempotencyKey);
-      if (raced?.payload_hash === payloadHash) return { id: raced.id, status: raced.status, reused: true };
+      if (raced?.payload_hash === payloadHash) return { id: raced.id, status: raced.status, reused: true, ...(raced.scheduled_at ? { scheduledAt: raced.scheduled_at } : {}) };
       throw new AppError(409, 'idempotency_mismatch', 'La clave de idempotencia se usó con otro mensaje.');
     }
     throw error;
@@ -610,11 +845,22 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
     try { await releaseStorage(env.DB, config.mailbox.id, payloadBytes, true); } catch { /* the failed row remains auditable */ }
     throw new AppError(503, 'payload_store_failed', 'No se pudo conservar el envío para procesarlo.');
   }
+  if (scheduledAt) {
+    // The draft becomes a scheduled message; it must not stay in Borradores.
+    if (input.draftId) {
+      try { await deleteDraft(env, config, identity, input.draftId); } catch { /* the scheduled row remains authoritative */ }
+    }
+    return { id: messageId, status: 'scheduled', reused: false, scheduledAt };
+  }
   if (!await claimOutbox(env.DB, messageId)) {
     const raced = await findIdempotency(env.DB, config.mailbox.id, idempotencyKey);
-    return { id: messageId, status: raced?.status ?? 'unknown', reused: true };
+    if (raced?.status === 'accepted' && input.draftId) {
+      try { await deleteDraft(env, config, identity, input.draftId); } catch { /* sending remains authoritative */ }
+    }
+    return { id: messageId, status: raced?.status ?? 'unknown', reused: true, ...(raced?.scheduled_at ? { scheduledAt: raced.scheduled_at } : {}) };
   }
-  const outbound: OutboundMessage = { id: messageId, from: address, to: recipients, subject: input.subject, text: input.text, attachments: payloadAttachments, headers: Object.fromEntries(Object.entries(headers).filter(([name]) => SAFE_HEADER_NAMES.has(name.toLowerCase()))), customId: messageId, archiveAddress: archive, archiveReplyToken };
+  const replyHtml = renderReplyHtml(input.text, config.brand.primaryColor);
+  const outbound: OutboundMessage = { id: messageId, from: address, to: recipients, subject: input.subject, text: input.text, ...(replyHtml ? { html: replyHtml } : {}), attachments: payloadAttachments, headers: Object.fromEntries(Object.entries(headers).filter(([name]) => SAFE_HEADER_NAMES.has(name.toLowerCase()))), customId: messageId, archiveAddress: archive, archiveReplyToken };
   let result: ProviderResult;
   try {
     result = await providerFor(config).send(env, config, outbound);
@@ -633,7 +879,161 @@ export async function sendMessage(env: Env, config: MailConfig, identity: Identi
     return { id: messageId, status: 'unknown', reused: false };
   }
   if (config.provider === 'local' && result.outcome === 'accepted') await env.DB.prepare(`UPDATE mail_messages SET archive_status = 'smtp_accepted' WHERE id = ? AND archive_address = ?`).bind(messageId, archive).run();
-  return { id: messageId, status: providerResultStatus(result), reused: false };
+  const status = providerResultStatus(result);
+  if (status === 'accepted' && input.draftId) {
+    try { await deleteDraft(env, config, identity, input.draftId); } catch { /* sending remains authoritative */ }
+  }
+  return { id: messageId, status, reused: false };
+}
+
+interface ScheduledPayload {
+  from?: { email?: unknown; name?: unknown };
+  to?: unknown;
+  cc?: unknown;
+  bcc?: unknown;
+  subject?: unknown;
+  text?: unknown;
+  attachments?: unknown;
+  headers?: unknown;
+  archiveReplyToken?: unknown;
+}
+
+export interface ScheduledFlushResult {
+  due: number;
+  sent: number;
+  failed: number;
+  unknown: number;
+}
+
+/**
+ * Delivers scheduled messages whose UTC instant has arrived. The outbox row is
+ * claimed conditionally before the provider call, so overlapping cron ticks
+ * can never send the same message twice.
+ */
+export async function flushScheduledMessages(env: Env, config: MailConfig, at = new Date()): Promise<ScheduledFlushResult> {
+  validateConfig(config);
+  await ensureSchema(env.DB);
+  const now = at.toISOString();
+  try {
+    await recoverStaleScheduledOutbox(env.DB, new Date(at.getTime() - 15 * 60_000).toISOString());
+  } catch { /* a recovery sweep must not block newly due messages */ }
+
+  const due = await listDueOutbox(env.DB, now, 20);
+  let sent = 0;
+  let failed = 0;
+  let unknown = 0;
+  for (const row of due) {
+    if (!await claimDueOutbox(env.DB, row.id, now)) continue;
+    const fail = async (code: string) => {
+      try { await setOutboxStatus(env.DB, row.id, 'failed', code); } catch { /* keep processing other due rows */ }
+      failed += 1;
+    };
+    if (row.provider !== config.provider) {
+      await fail('provider_mismatch');
+      continue;
+    }
+
+    let payload: ScheduledPayload | null = null;
+    try {
+      const object = await getObject(getMailStore(env, config), row.payload_key);
+      payload = parseJson<ScheduledPayload | null>(await object.text(), null);
+    } catch {
+      await fail('payload_not_available');
+      continue;
+    }
+    if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
+      await fail('payload_invalid');
+      continue;
+    }
+    if (typeof payload.subject !== 'string' || payload.subject.length > 255 || /[\r\n]/.test(payload.subject) || typeof payload.text !== 'string') {
+      await fail('payload_invalid');
+      continue;
+    }
+
+    let to: string[];
+    let cc: string[];
+    let bcc: string[];
+    let attachments: ReturnType<typeof normalizeAttachments>;
+    try {
+      to = validateAddressList(payload.to as string[] | undefined, 'to');
+      cc = validateAddressList(payload.cc as string[] | undefined, 'cc');
+      bcc = validateAddressList(payload.bcc as string[] | undefined, 'bcc');
+      attachments = normalizeAttachments(payload.attachments, config);
+    } catch {
+      await fail('payload_invalid');
+      continue;
+    }
+    if (!to.length || [...to, ...cc, ...bcc].length > 10) {
+      await fail('recipient_limit');
+      continue;
+    }
+    if (to.some((email) => cc.includes(email) || bcc.includes(email)) || cc.some((email) => bcc.includes(email))) {
+      await fail('recipient_duplicate');
+      continue;
+    }
+
+    const payloadEmail = payload.from && typeof payload.from.email === 'string' ? normalizeEmail(payload.from.email) : '';
+    const sender = mailIdentities(config).find((identity) => normalizeEmail(identity.email) === payloadEmail);
+    if (!sender) {
+      await fail('sender_forbidden');
+      continue;
+    }
+    const archive = normalizeEmail(config.archiveAddress);
+    const recipients = recipientRows(to, cc, bcc);
+    if (!recipients.some((recipient) => recipient.email === archive)) {
+      await fail('archive_recipient_missing');
+      continue;
+    }
+    const archiveReplyToken = typeof payload.archiveReplyToken === 'string' && payload.archiveReplyToken.length <= 8192
+      ? payload.archiveReplyToken
+      : undefined;
+    if (config.archiveCopies?.enabled && !archiveReplyToken) {
+      await fail('archive_copy_not_configured');
+      continue;
+    }
+    const headers = payload.headers && typeof payload.headers === 'object' && !Array.isArray(payload.headers)
+      ? Object.fromEntries(Object.entries(payload.headers).filter(([name, value]) => SAFE_HEADER_NAMES.has(name.toLowerCase()) && typeof value === 'string'))
+      : {};
+    const senderName = payload.from && typeof payload.from.name === 'string' ? payload.from.name.slice(0, MAX_DISPLAY_NAME) : sender.name;
+    const replyHtml = renderReplyHtml(payload.text, config.brand.primaryColor);
+    const outbound: OutboundMessage = {
+      id: row.id,
+      from: { email: sender.email, ...(senderName ? { name: senderName } : {}) },
+      to: recipients,
+      subject: payload.subject,
+      text: payload.text,
+      ...(replyHtml ? { html: replyHtml } : {}),
+      attachments: attachments.map(({ filename, mimeType, contentBase64 }) => ({ filename, mimeType, contentBase64 })),
+      headers,
+      customId: row.id,
+      archiveAddress: archive,
+      ...(archiveReplyToken ? { archiveReplyToken } : {}),
+    };
+
+    let result: ProviderResult;
+    try {
+      result = await providerFor(config).send(env, config, outbound);
+    } catch {
+      result = { outcome: 'unknown', recipients: recipients.map((recipient) => ({ ...recipient, status: 'unknown' })), code: 'provider_unknown', safeMessage: 'El proveedor no confirmó el resultado.' };
+    }
+    try {
+      await persistProviderResult(env.DB, row.id, result);
+    } catch {
+      // Keep the row auditable even if the provider result could not be saved.
+      // Marking the message first avoids it looking scheduled forever when the
+      // outbox status update succeeds but the batch above did not.
+      try { await env.DB.prepare(`UPDATE mail_messages SET send_status = 'unknown' WHERE id = ? AND send_status IN ('scheduled', 'sending')`).bind(row.id).run(); } catch { /* D1 may be unavailable too */ }
+      try { await setOutboxStatus(env.DB, row.id, 'unknown', 'result_persist_failed'); } catch { /* D1 may be unavailable too */ }
+      unknown += 1;
+      continue;
+    }
+    if (result.outcome === 'accepted') {
+      if (config.provider === 'local') await env.DB.prepare(`UPDATE mail_messages SET archive_status = 'smtp_accepted' WHERE id = ? AND archive_address = ?`).bind(row.id, archive).run();
+      sent += 1;
+    } else if (result.outcome === 'definite_failure') failed += 1;
+    else unknown += 1;
+  }
+  return { due: due.length, sent, failed, unknown };
 }
 
 export async function forwardIncomingOriginal(_env: Env, config: MailConfig, message: IncomingEmail): Promise<{ forwarded: boolean; cacheRaw: ReadableStream<Uint8Array> }> {
@@ -659,6 +1059,12 @@ export async function receiveEmail(env: Env, config: MailConfig, message: Incomi
   const headers = message.headers;
   const subject = parseHeader(headers, 'subject', 998) || '';
   const rfcMessageId = parseHeader(headers, 'message-id', 998);
+  const envelopeFrom = parseAddress(message.from || 'unknown@example.invalid');
+  const headerFrom = parseHeader(headers, 'from', MAX_ADDRESS_HEADER);
+  const parsedHeaderFrom = headerFrom ? parseAddress(headerFrom) : undefined;
+  const from = parsedHeaderFrom && EMAIL_RE.test(parsedHeaderFrom.email) ? parsedHeaderFrom : envelopeFrom;
+  const spam = classifyIncomingSpam(headers, from.email, config);
+  const incomingFilter = matchIncomingFilter(from.email, subject, config.incomingFilters);
   const incomingKey = await incomingDedupeKey(recipient, rfcMessageId).catch(() => undefined);
 
   // Dedupe before forwarding when D1 is available. A retried delivery with the
@@ -715,10 +1121,6 @@ export async function receiveEmail(env: Env, config: MailConfig, message: Incomi
     if (!forwarded) message.setReject('No se pudo entregar ni conservar el mensaje.');
     return;
   }
-  const envelopeFrom = parseAddress(message.from || 'unknown@example.invalid');
-  const headerFrom = parseHeader(headers, 'from', MAX_ADDRESS_HEADER);
-  const parsedHeaderFrom = headerFrom ? parseAddress(headerFrom) : undefined;
-  const from = parsedHeaderFrom && EMAIL_RE.test(parsedHeaderFrom.email) ? parsedHeaderFrom : envelopeFrom;
   const to = parseAddressList(parseHeader(headers, 'to') || message.to).slice(0, 50);
   const cc = parseAddressList(parseHeader(headers, 'cc')).slice(0, 50);
   const replyToHeader = parseAddress(parseHeader(headers, 'reply-to') || '');
@@ -729,7 +1131,14 @@ export async function receiveEmail(env: Env, config: MailConfig, message: Incomi
   try {
     const insert = env.DB.prepare(`INSERT INTO mail_messages (id, mailbox_id, direction, from_email, from_name, to_json, cc_json, subject, reply_to_json, rfc_message_id, references_json, raw_key, size_bytes, created_at, received_at, expires_at, receipt_id, archive_address, archive_status, incoming_key) VALUES (?, ?, 'incoming', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .bind(messageId, config.mailbox.id, from.email, from.name ?? '', json(to), json(cc), subject, hasReplyTo ? json(replyToHeader) : null, rfcMessageId ?? null, json(references), rawKey, size, receivedAt, receivedAt, expiresAt, receiptId, config.archiveAddress, forwarded ? 'forward_accepted' : 'failed', incomingKey ?? null);
-    await env.DB.batch([insert, env.DB.prepare('INSERT INTO mail_message_identities (message_id, address) VALUES (?, ?)').bind(messageId, recipient)]);
+    const statements = [insert, env.DB.prepare('INSERT INTO mail_message_identities (message_id, address) VALUES (?, ?)').bind(messageId, recipient)];
+    if (incomingFilter) {
+      statements.push(env.DB.prepare('INSERT INTO mail_message_filters (message_id, mailbox_id, label, rule_id, created_at) VALUES (?, ?, ?, ?, ?)').bind(messageId, config.mailbox.id, incomingFilter.label, incomingFilter.id, receivedAt));
+    }
+    if (spam.isSpam) {
+      statements.push(env.DB.prepare('INSERT INTO mail_message_spam (message_id, mailbox_id, is_spam, reason, source, updated_at) VALUES (?, ?, 1, ?, ?, ?)').bind(messageId, config.mailbox.id, spam.reason, spam.source, receivedAt));
+    }
+    await env.DB.batch(statements);
   } catch (error) {
     if (isUniqueConstraint(error)) {
       // A concurrent duplicate won the unique incoming key. Remove this
@@ -741,7 +1150,7 @@ export async function receiveEmail(env: Env, config: MailConfig, message: Incomi
     // retained copy when indexing fails.
     return;
   }
-  if (config.incomingSummary?.enabled) {
+  if (!incomingFilter && !spam.isSpam && config.incomingSummary?.enabled) {
     try {
       const replyAddress = parseAddress(parseHeader(headers, 'reply-to') || headerFrom || from.email);
       const replyTo = EMAIL_RE.test(replyAddress.email) && replyAddress.email.length <= 254 ? [normalizeEmail(replyAddress.email)] : [];
@@ -759,9 +1168,9 @@ export async function receiveEmail(env: Env, config: MailConfig, message: Incomi
         ...(parentId ? { inReplyTo: parentId } : {}),
         references: archiveReferences(references),
       });
-      // A summary failure is intentionally isolated from both the original
-      // forwarding and the temporary inbox copy.
-      await flushIncomingSummaries(env, config);
+      // The scheduler sends pending summaries at the configured time. A summary
+      // failure is intentionally isolated from both native forwarding and the
+      // temporary inbox copy.
     } catch { console.warn('webmail_incoming_summary_failed'); }
   }
 }
@@ -829,7 +1238,7 @@ export async function cleanup(env: Env, config: MailConfig): Promise<{ deleted: 
   catch { /* The message index cleanup can continue if staging maintenance is unavailable. */ }
   await ensureSchema(env.DB);
   const now = nowIso();
-  const candidates = await env.DB.prepare(`SELECT m.*, o.idempotency_key, o.payload_hash, o.status AS outbox_status FROM mail_messages m LEFT JOIN mail_outbox o ON o.id = m.id WHERE m.mailbox_id = ? AND m.expires_at <= ? AND m.delete_state IN ('active','deleting') AND m.archive_status NOT IN ('pending','failed','unknown') AND (m.send_status IS NULL OR m.send_status NOT IN ('pending','sending','unknown')) ORDER BY m.expires_at ASC, m.id ASC LIMIT 20`).bind(config.mailbox.id, now).all<MessageRow>();
+  const candidates = await env.DB.prepare(`SELECT m.*, o.idempotency_key, o.payload_hash, o.status AS outbox_status FROM mail_messages m LEFT JOIN mail_outbox o ON o.id = m.id WHERE m.mailbox_id = ? AND m.expires_at <= ? AND m.delete_state IN ('active','deleting') AND m.archive_status NOT IN ('pending','failed','unknown') AND (m.send_status IS NULL OR m.send_status NOT IN ('pending','sending','scheduled','unknown')) ORDER BY m.expires_at ASC, m.id ASC LIMIT 20`).bind(config.mailbox.id, now).all<MessageRow>();
   let deleted = 0;
   for (const row of candidates.results ?? []) {
     if (row.delete_state === 'active') {
@@ -855,12 +1264,14 @@ export async function cleanup(env: Env, config: MailConfig): Promise<{ deleted: 
       env.DB.prepare(`DELETE FROM mail_read_states WHERE message_id = ?`).bind(row.id),
       env.DB.prepare(`DELETE FROM mail_outbox_recipients WHERE outbox_id = ?`).bind(row.id),
       env.DB.prepare(`DELETE FROM mail_outbox WHERE id = ?`).bind(row.id),
+      env.DB.prepare(`DELETE FROM mail_message_filters WHERE message_id = ?`).bind(row.id),
+      env.DB.prepare(`DELETE FROM mail_message_spam WHERE message_id = ?`).bind(row.id),
       env.DB.prepare(`DELETE FROM mail_messages WHERE id = ? AND delete_state = 'deleting'`).bind(row.id),
       env.DB.prepare(`UPDATE mail_storage_counters SET used_bytes = CASE WHEN used_bytes >= ? THEN used_bytes - ? ELSE 0 END, paused = CASE WHEN used_bytes <= ? THEN 0 ELSE paused END, updated_at = ? WHERE mailbox_id = ?`).bind(row.size_bytes, row.size_bytes, config.storageBudgetBytes, now, config.mailbox.id),
     ]);
     deleted += 1;
   }
-  const heldRow = await env.DB.prepare(`SELECT COUNT(*) AS count FROM mail_messages WHERE mailbox_id = ? AND delete_state IN ('active','deleting') AND expires_at <= ? AND (archive_status IN ('pending','failed','unknown') OR send_status IN ('pending','sending','unknown'))`).bind(config.mailbox.id, now).first<{ count: number }>();
+  const heldRow = await env.DB.prepare(`SELECT COUNT(*) AS count FROM mail_messages WHERE mailbox_id = ? AND delete_state IN ('active','deleting') AND expires_at <= ? AND (archive_status IN ('pending','failed','unknown') OR send_status IN ('pending','sending','scheduled','unknown'))`).bind(config.mailbox.id, now).first<{ count: number }>();
   await env.DB.prepare(`DELETE FROM mail_idempotency_tombstones WHERE expires_at <= ?`).bind(now).run();
   await env.DB.prepare(`DELETE FROM mail_webhook_events WHERE received_at <= ?`).bind(addDaysIso(-Math.max(30, config.retentionDays + 30))).run();
   try { await cleanupSummaryState(env.DB, config.retentionDays); }

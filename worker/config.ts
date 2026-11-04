@@ -1,4 +1,4 @@
-import type { Env, MailConfig } from './types';
+import type { Env, IncomingFilterRule, MailConfig } from './types';
 import type { Address } from '../shared/contracts';
 import { AppError } from './errors';
 
@@ -94,12 +94,77 @@ export function loadConfig(env: Env): MailConfig {
     const timeZone = string(summary.timeZone, 'UTC', 64);
     try { new Intl.DateTimeFormat('en', { timeZone }).format(new Date()); }
     catch { throw new AppError(503, 'CONFIG_INVALID', 'La zona horaria del resumen no es válida.'); }
+    const schedule = summary.schedule;
+    if (schedule !== undefined && (schedule === null || Array.isArray(schedule) || typeof schedule !== 'object')) {
+      throw new AppError(503, 'CONFIG_INVALID', 'El horario del resumen de entrantes no está configurado correctamente.');
+    }
+    const scheduleConfig = (schedule ?? {}) as Record<string, unknown>;
     incomingSummary = {
       enabled: summary.enabled,
-      batchSize: integer(summary.batchSize, 5, 1, 50),
       ...(from ? { from } : {}),
       timeZone,
+      schedule: {
+        hour: integer(scheduleConfig.hour, 8, 0, 23),
+        minute: integer(scheduleConfig.minute, 0, 0, 59),
+        weekdaysOnly: scheduleConfig.weekdaysOnly !== false,
+      },
     };
+  }
+  let incomingFilters: IncomingFilterRule[] | undefined;
+  if (raw.incomingFilters !== undefined) {
+    if (!Array.isArray(raw.incomingFilters) || raw.incomingFilters.length > 50) {
+      throw new AppError(503, 'CONFIG_INVALID', 'Los filtros de entrada no están configurados correctamente.');
+    }
+    const ids = new Set<string>();
+    let totalFrom = 0;
+    incomingFilters = raw.incomingFilters.map((value: unknown) => {
+      if (!value || typeof value !== 'object' || Array.isArray(value)) {
+        throw new AppError(503, 'CONFIG_INVALID', 'Cada filtro de entrada debe ser un objeto.');
+      }
+      const rule = value as Record<string, unknown>;
+      const id = rule.id;
+      if (typeof id !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(id) || ids.has(id)) {
+        throw new AppError(503, 'CONFIG_INVALID', 'Cada filtro debe tener un identificador único válido.');
+      }
+      ids.add(id);
+      const label = string(rule.label, '', 80).trim();
+      if (!label) throw new AppError(503, 'CONFIG_INVALID', 'Cada filtro debe tener una etiqueta.');
+      if (rule.from !== undefined && (!Array.isArray(rule.from) || !rule.from.length || rule.from.length > 500)) {
+        throw new AppError(503, 'CONFIG_INVALID', 'La lista de remitentes de un filtro no es válida.');
+      }
+      const from = rule.from === undefined ? undefined : [...new Set((rule.from as unknown[]).map((address) => normalizeEmail(address)))];
+      totalFrom += from?.length ?? 0;
+      if (totalFrom > 2000) throw new AppError(503, 'CONFIG_INVALID', 'Hay demasiados remitentes configurados en los filtros.');
+      if (rule.subjectContains !== undefined && (!Array.isArray(rule.subjectContains) || !rule.subjectContains.length || rule.subjectContains.length > 50)) {
+        throw new AppError(503, 'CONFIG_INVALID', 'La lista de asuntos de un filtro no es válida.');
+      }
+      const subjectContains = rule.subjectContains === undefined ? undefined : [...new Set((rule.subjectContains as unknown[]).map((part) => {
+        if (typeof part !== 'string' || !part.trim() || part.length > 200 || /[\x00-\x1f\x7f]/.test(part)) {
+          throw new AppError(503, 'CONFIG_INVALID', 'Un asunto de filtro no es válido.');
+        }
+        return part.trim();
+      }))];
+      if (!from?.length && !subjectContains?.length) {
+        throw new AppError(503, 'CONFIG_INVALID', 'Cada filtro necesita remitentes o asuntos.');
+      }
+      return {
+        id,
+        label,
+        ...(from?.length ? { from } : {}),
+        ...(subjectContains?.length ? { subjectContains } : {}),
+      };
+    });
+    if (!incomingFilters.length) incomingFilters = undefined;
+  }
+  let spamProtection: MailConfig['spamProtection'];
+  if (raw.spamProtection !== undefined) {
+    const policy = raw.spamProtection;
+    if (!policy || typeof policy !== 'object' || Array.isArray(policy)
+      || (policy.enabled !== undefined && typeof policy.enabled !== 'boolean')
+      || (policy.blockedSenders !== undefined && (!Array.isArray(policy.blockedSenders) || policy.blockedSenders.length > 500))) {
+      throw new AppError(503, 'CONFIG_INVALID', 'La protección de spam no está configurada correctamente.');
+    }
+    spamProtection = { enabled: policy.enabled !== false, blockedSenders: [...new Set<string>((policy.blockedSenders ?? []).map(normalizeEmail))] };
   }
   return {
     brand: { name: brandName, logo, primaryColor: color, locale: string(raw.brand?.locale, 'es', 30) },
@@ -122,6 +187,8 @@ export function loadConfig(env: Env): MailConfig {
       enabled: raw.archiveCopies?.enabled !== false,
       maxDecoratedBytes: integer(raw.archiveCopies?.maxDecoratedBytes, 3145728, 1024, 3145728),
     },
+    ...(incomingFilters ? { incomingFilters } : {}),
+    ...(spamProtection ? { spamProtection } : {}),
     ...(incomingSummary ? { incomingSummary } : {}),
     ...(raw.usageAlerts ? { usageAlerts: {
       enabled: !local && raw.usageAlerts.enabled,

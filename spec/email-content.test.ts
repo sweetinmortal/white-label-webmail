@@ -44,7 +44,51 @@ function rawMessage(): ArrayBuffer {
   return new TextEncoder().encode(raw).buffer;
 }
 
+function alternativeMessage(html: string, text: string): ArrayBuffer {
+  const raw = [
+    'From: Ana <ana@example.net>',
+    'To: reader@example.net',
+    'Subject: Alternativa',
+    'MIME-Version: 1.0',
+    'Content-Type: multipart/alternative; boundary="alt"',
+    '',
+    '--alt',
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    text,
+    '--alt',
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: 8bit',
+    '',
+    html,
+    '--alt--',
+    '',
+  ].join('\r\n');
+  return new TextEncoder().encode(raw).buffer;
+}
+
 describe('parsed email content', () => {
+  it('prefers readable HTML text over a generic plain-text warning', async () => {
+    const parsed = await parseEmailContent(alternativeMessage(
+      '<html><body><p>Estimado proveedor, revise la invitación.</p><p>Detalle real.</p></body></html>',
+      'Su lector de correo no soporta mensajes HTML',
+    ));
+
+    expect(parsed.bodyText).toContain('Estimado proveedor, revise la invitación.');
+    expect(parsed.bodyText).toContain('Detalle real.');
+    expect(parsed.bodyText).not.toContain('Su lector de correo no soporta mensajes HTML');
+  });
+
+  it('keeps plain text when the HTML alternative has no readable text', async () => {
+    const parsed = await parseEmailContent(alternativeMessage(
+      '<html><body><img src="https://example.test/only-image.png"></body></html>',
+      'Contenido real en texto plano',
+    ));
+
+    expect(parsed.bodyText).toBe('Contenido real en texto plano');
+  });
+
   it('returns a sanitized HTML body, CID metadata, and ordinary attachments', async () => {
     const parsed = await parseEmailContent(rawMessage());
 

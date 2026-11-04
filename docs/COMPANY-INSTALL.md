@@ -13,7 +13,8 @@ Revisa la marca de ejemplo en `public/brand/logo.svg`; reemplázala por el SVG a
 - `archiveAddress`: buzón de archivo independiente;
 - `appOrigin`, retención, almacenamiento y límites;
 - `maxAttachments` y `maxAttachmentBytes`: máximo de archivos por envío y suma binaria de adjuntos. Los valores seguros para Mailjet Free son 5 archivos y 5 MB; no los aumentes sin revisar el límite total de 15 MB del proveedor, el inflado base64 y la copia de archivo duplicada;
-- `incomingSummary`: reenvío de originales y resumen periódico. Si se activa, `from.email` debe ser una dirección de la empresa autorizada en Cloudflare Email Service.
+- `incomingSummary`: resumen diario con horario y zona configurables. Si se activa, `from.email` debe ser una dirección autorizada en Cloudflare Email Service;
+- `spamProtection`: protección configurable con `enabled` y una lista inicial vacía `blockedSenders`; cada instalación administra su propia lista.
 
 La dirección principal puede aparecer en `identities`; el Worker la conserva una sola vez. No repitas otras direcciones ni uses el archivo como identidad. Se admiten hasta veinte identidades. El remitente del resumen no se agrega al selector From: es una identidad de servicio y debe configurarse explícitamente.
 
@@ -28,23 +29,29 @@ El resumen es un flujo independiente:
 ```json
 "incomingSummary": {
   "enabled": true,
-  "batchSize": 5,
   "from": { "name": "Webmail de Mi Empresa", "email": "webmail@empresa.example" },
-  "timeZone": "America/Guayaquil"
+  "timeZone": "UTC",
+  "schedule": { "hour": 8, "minute": 0, "weekdaysOnly": true }
 }
 ```
 
 - Se cuenta por empresa y buzón compartido, no por usuario.
 - Solo cuentan entradas válidas y deduplicadas por `recipient + Message-ID`.
-- Se excluyen enviados, callbacks, alertas de uso y los propios resúmenes.
-- Con `batchSize: 5`, cuatro mensajes dejan 0 resúmenes y 4 pendientes; cinco envían 1; diez envían 2; doce envían 2 y dejan 2 pendientes.
-- Nunca se envía un lote incompleto por el paso del tiempo.
-- Cada elemento muestra remitente, asunto, dirección institucional receptora, fecha/hora y el botón **Responder en el webmail**.
+- Se excluyen enviados, callbacks, alertas de uso, mensajes Filtrados o Spam y los propios resúmenes.
+- Se envían los mensajes pendientes en el horario configurado, agrupados en correos de hasta 100 elementos; un día con más entradas puede producir varios correos.
+- Cada resumen tiene un único botón general **Ver webmail**.
 - El resumen se envía a `archiveAddress` mediante el binding `ARCHIVE_EMAIL_COPY` y el remitente de servicio configurado.
-- Los botones usan enlaces cifrados y funcionan aunque el original temporal ya haya caducado.
 - El estado se guarda en D1. Un fallo de D1, Turso o del resumen no bloquea el reenvío del original.
 
 El estado de un lote distingue `accepted`, `failed` y `unknown`. Un lote marcado como `sending` que queda obsoleto pasa a `unknown` y no se reintenta automáticamente; un `claiming` obsoleto devuelve sus elementos a `pending`. Un `failed` solo representa un fallo definitivo antes de llamar al proveedor: sus elementos vuelven a `pending` para un máximo de 3 intentos y después quedan `failed`. Un `unknown` no se reencola. Un fallo de D1 tampoco se usa como motivo para duplicar el original.
+
+### Filtros, Spam, borradores y envíos programados
+
+`incomingFilters` configura por instalación los mensajes que van a **Filtrados**: permanecen disponibles para revisar y responder, pero no aparecen en Recibidos ni en el resumen. La protección de Spam es independiente de esos filtros; clasifica según señales del mensaje y `spamProtection.blockedSenders`. Los originales siempre se reenvían al archivo. Revisa [Spam y recuperación](SPAM.md) para las señales y el procedimiento de corrección.
+
+Los borradores se guardan automáticamente y son privados del usuario autenticado. Se almacenan en el backend configurado junto con los adjuntos. Los envíos programados se muestran en **Enviados**; la fecha y hora que elige la persona usan la zona local del navegador y se almacenan en UTC.
+
+El Worker usa `* * * * *` para reclamar envíos programados y comprobar el horario configurable del resumen. `15 * * * *` conserva las tareas de mantenimiento y alertas. El horario del resumen se define con `incomingSummary.timeZone` y `incomingSummary.schedule`; no requiere un cron fijo para una zona geográfica concreta.
 
 ## 2. Elegir autenticación
 
@@ -78,15 +85,15 @@ Configura el callback HTTPS `https://<dominio-del-webmail>/api/webhooks/mailjet`
 - `TURSO_AUTH_TOKEN` si el almacén es Turso;
 - `CF_USAGE_API_TOKEN` si se habilitan alertas de uso;
 - `GOOGLE_CLIENT_SECRET` si `auth.provider` es `google`;
-- `ARCHIVE_LINK_KEY`, necesaria para los enlaces de archivo y del resumen.
+- `ARCHIVE_LINK_KEY`, necesaria para los enlaces de respuesta de las copias archivadas.
 
-Ejecuta `npm run archive:key` después de generar la configuración de producción y antes de recibir enlaces. La clave es propia de la instalación. El script conserva una clave remota existente; rotarla invalida los enlaces antiguos.
+Ejecuta `npm run archive:key` después de generar la configuración de producción y antes de recibir enlaces de respuesta archivados. La clave es propia de la instalación. El script conserva una clave remota existente; rotarla invalida los enlaces antiguos.
 
 La configuración de `identities` no habilita aliases remotos, rutas de entrada ni remitentes de Mailjet. Completa y prueba esas operaciones en los servicios externos por cada dirección.
 
 ## 5. Aplicar migraciones y desplegar
 
-Aplica las migraciones D1 en orden con la configuración de producción antes de desplegar. La migración `migrations/0006_incoming_summary.sql` agrega la deduplicación de entrantes y las tablas del resumen. Usa como nombre de base el configurado en `deployment.local.json`, por ejemplo:
+Aplica las migraciones D1 en orden con la configuración de producción antes de desplegar. Conserva los nombres históricos `0001`–`0009`: varias instalaciones ya aplicaron `0007_incoming_filters.sql`, `0008_drafts.sql` y `0009_scheduled_send_and_labels.sql`; no los renombres ni los reapliques con otros nombres, en particular `0009` agrega `scheduled_at`. La nueva migración `202611040900_message_spam.sql` es aditiva; haz un respaldo D1 antes de aplicarla. Usa como nombre de base el configurado en `deployment.local.json`, por ejemplo:
 
 `npx wrangler d1 migrations apply company-mail --remote --config wrangler.production.jsonc`
 
@@ -94,7 +101,7 @@ Si usas Turso, aplica `turso-migrations/0001_objects.sql` mediante el flujo SQL 
 
 Ejecuta `npm run deploy:check` para typecheck, pruebas, build, doctor estricto y dry run. Revisa la configuración generada y aplica el procedimiento de publicación de tu empresa; `npm run deploy` realiza el despliegue real.
 
-Comprueba entrada para cada dirección, reenvío inmediato al archivo, remitentes From, filtro de bandeja, resumen tras el lote configurado, enlaces de respuesta, envío y callback. La aceptación del proveedor no demuestra entrega final.
+Comprueba entrada para cada dirección, reenvío inmediato al archivo, remitentes From, filtros, revisión y restauración de Spam, borradores, envíos programados, resumen diario y callback. La aceptación del proveedor no demuestra entrega final.
 
 ## Formato, imágenes y adjuntos
 

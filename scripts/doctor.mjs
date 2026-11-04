@@ -81,13 +81,46 @@ if (company) {
   if (company.archiveCopies !== undefined && (!company.archiveCopies || typeof company.archiveCopies.enabled !== 'boolean' || (company.archiveCopies.maxDecoratedBytes !== undefined && (!Number.isSafeInteger(company.archiveCopies.maxDecoratedBytes) || company.archiveCopies.maxDecoratedBytes < 1024 || company.archiveCopies.maxDecoratedBytes > 3145728)))) errors.push('archiveCopies no es válido: revisa enabled y el tamaño máximo de 3 MiB.');
   if (company.incomingSummary !== undefined) {
     const summary = company.incomingSummary;
-    if (!summary || typeof summary.enabled !== 'boolean' || !Number.isSafeInteger(summary.batchSize) || summary.batchSize < 1 || summary.batchSize > 50) {
-      errors.push('incomingSummary no es válido: revisa enabled y batchSize.');
+    const schedule = summary?.schedule;
+    if (!summary || typeof summary.enabled !== 'boolean' || !schedule ||
+        !Number.isSafeInteger(schedule.hour) || schedule.hour < 0 || schedule.hour > 23 ||
+        !Number.isSafeInteger(schedule.minute) || schedule.minute < 0 || schedule.minute > 59 ||
+        typeof schedule.weekdaysOnly !== 'boolean') {
+      errors.push('incomingSummary no es válido: revisa enabled y schedule.');
     } else if (summary.enabled) {
       if (!summary.from || typeof summary.from.email !== 'string' || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(summary.from.email)) errors.push('incomingSummary.from.email es obligatorio cuando el resumen está activo.');
       if (summary.from?.email === company.archiveAddress) errors.push('El remitente del resumen no puede ser el buzón de archivo.');
       try { new Intl.DateTimeFormat('en', { timeZone: summary.timeZone ?? 'UTC' }).format(new Date()); }
       catch { errors.push('incomingSummary.timeZone no es válida.'); }
+    }
+  }
+  if (company.incomingFilters !== undefined) {
+    if (!Array.isArray(company.incomingFilters) || company.incomingFilters.length > 50) {
+      errors.push('incomingFilters debe ser una lista de hasta cincuenta filtros.');
+    } else {
+      const ids = new Set();
+      let totalFrom = 0;
+      for (const rule of company.incomingFilters) {
+        if (!rule || typeof rule !== 'object' || Array.isArray(rule)
+          || typeof rule.id !== 'string' || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(rule.id) || ids.has(rule.id)
+          || typeof rule.label !== 'string' || !rule.label.trim() || rule.label.length > 80) {
+          errors.push('Cada filtro debe tener un id único y una etiqueta válida.');
+          continue;
+        }
+        ids.add(rule.id);
+        const from = rule.from;
+        const subjectContains = rule.subjectContains;
+        if (from !== undefined && (!Array.isArray(from) || !from.length || from.length > 500 || from.some((address) => typeof address !== 'string' || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(address)))) {
+          errors.push(`El filtro ${rule.id} tiene remitentes no válidos.`);
+        } else {
+          totalFrom += from?.length ?? 0;
+        }
+        if (subjectContains !== undefined && (!Array.isArray(subjectContains) || !subjectContains.length || subjectContains.length > 50 || subjectContains.some((part) => typeof part !== 'string' || !part.trim() || part.length > 200 || /[\x00-\x1f\x7f]/.test(part)))) {
+          errors.push(`El filtro ${rule.id} tiene asuntos no válidos.`);
+        }
+        if (!from?.length && !subjectContains?.length) errors.push(`El filtro ${rule.id} necesita remitentes o asuntos.`);
+      }
+      if (totalFrom > 2000) errors.push('Hay demasiados remitentes configurados en los filtros.');
     }
   }
   if (company.archiveAddress === company.mailbox?.address) errors.push('El archivo principal forma un bucle con el remitente.');

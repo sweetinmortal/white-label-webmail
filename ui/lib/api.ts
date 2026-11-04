@@ -2,6 +2,8 @@ import type { MessageDetail, SessionInfo } from '../../shared/contracts';
 
 export const MAX_PREVIEW_BYTES = 10 * 1024 * 1024;
 export const MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024;
+const RAW_PREVIEW_TIMEOUT_MS = 15_000;
+const WORKER_RELOAD_KEY = 'webmail_worker_reload_once';
 
 export class ApiRequestError extends Error {
   constructor(public readonly status: number, message: string, public readonly code = 'request_failed') {
@@ -115,6 +117,25 @@ export async function requestOutgoingAttachment(messageId: string, index: number
   return response;
 }
 
+function reloadForFreshWorker(): boolean {
+  try {
+    if (window.sessionStorage.getItem(WORKER_RELOAD_KEY)) return false;
+    window.sessionStorage.setItem(WORKER_RELOAD_KEY, '1');
+    window.location.reload();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function clearWorkerReloadGuard(): void {
+  try {
+    window.sessionStorage.removeItem(WORKER_RELOAD_KEY);
+  } catch {
+    // Storage can be unavailable in private or restricted browser modes.
+  }
+}
+
 export async function parseRawInWorker(buffer: ArrayBuffer, signal: AbortSignal): Promise<ParsedRaw> {
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('../raw-parser.worker.ts', import.meta.url), { type: 'module' });
@@ -130,12 +151,16 @@ export async function parseRawInWorker(buffer: ArrayBuffer, signal: AbortSignal)
     };
     timer = window.setTimeout(() => {
       cleanup();
-      reject(new RawPreviewError('La vista previa tardó demasiado. Descarga el original para abrirlo.'));
-    }, 5000);
+      reject(new RawPreviewError('La vista previa tardó demasiado. Reintenta o descarga el original.'));
+    }, RAW_PREVIEW_TIMEOUT_MS);
     worker.onmessage = (event: MessageEvent<Partial<ParsedRaw> & { error?: string }>) => {
       cleanup();
-      if (event.data.error) reject(new RawPreviewError(event.data.error));
-      else resolve({
+      if (event.data.error) {
+        reject(new RawPreviewError(event.data.error));
+        return;
+      }
+      clearWorkerReloadGuard();
+      resolve({
         bodyText: event.data.bodyText || '',
         html: event.data.html || '',
         styles: event.data.styles || '',
@@ -145,7 +170,8 @@ export async function parseRawInWorker(buffer: ArrayBuffer, signal: AbortSignal)
     };
     worker.onerror = () => {
       cleanup();
-      reject(new RawPreviewError('No se pudo interpretar el original. Descárgalo para abrirlo.'));
+      if (reloadForFreshWorker()) return;
+      reject(new RawPreviewError('No se pudo cargar el lector del mensaje. Recarga el webmail o descarga el original.'));
     };
     if (signal.aborted) return onAbort();
     signal.addEventListener('abort', onAbort, { once: true });

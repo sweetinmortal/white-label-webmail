@@ -12,6 +12,8 @@ export interface OutboundMessage {
   to: OutboundRecipient[];
   subject: string;
   text: string;
+  /** HTML alternative. Kept as a fragment so archive copies can add their footer. */
+  html?: string;
   attachments: Array<{ filename: string; mimeType: string; contentBase64: string }>;
   headers: Record<string, string>;
   customId: string;

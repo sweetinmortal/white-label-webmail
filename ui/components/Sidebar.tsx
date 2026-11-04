@@ -1,13 +1,15 @@
-import { Bell, LoaderCircle, LogOut, Mail, Plus, Send } from 'lucide-react';
+import { Archive, Bell, FileText, Filter, LoaderCircle, LogOut, Mail, Plus, Send, ShieldAlert } from 'lucide-react';
 import { useState } from 'react';
 import type { Folder, SessionInfo } from '../../shared/contracts';
 import { apiFetch } from '../lib/api';
-import { initials } from '../lib/format';
+import { initials, labelColor } from '../lib/format';
 
-export default function Sidebar({ session, folder, onFolder, onCompose, onTestUsageAlert, usageAlertTestBusy, usageAlertTestPending }: {
+export default function Sidebar({ session, folder, labelFilter, onFolder, onLabel, onCompose, onTestUsageAlert, usageAlertTestBusy, usageAlertTestPending }: {
   session: SessionInfo;
   folder: Folder;
+  labelFilter: string | null;
   onFolder: (folder: Folder) => void;
+  onLabel: (label: string) => void;
   onCompose: () => void;
   onTestUsageAlert: () => void;
   usageAlertTestBusy: boolean;
@@ -37,8 +39,18 @@ export default function Sidebar({ session, folder, onFolder, onCompose, onTestUs
       <button className="button button-primary compose-button" type="button" onClick={onCompose}><Plus size={20} />Redactar</button>
       <nav className="folder-nav" aria-label="Carpetas">
         <button aria-label="Recibidos" className={folder === 'inbox' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('inbox')}><Mail size={18} /><span>Recibidos</span></button>
+        <button aria-label="Todos" className={folder === 'all' && !labelFilter ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('all')}><Archive size={18} /><span>Todos</span></button>
+        <button aria-label="Filtrados" className={folder === 'filtered' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('filtered')}><Filter size={18} /><span>Filtrados</span></button>
+        <button aria-label="Spam" className={folder === 'spam' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('spam')}><ShieldAlert size={18} /><span>Spam</span></button>
         <button aria-label="Enviados" className={folder === 'sent' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('sent')}><Send size={18} /><span>Enviados</span></button>
+        <button aria-label="Borradores" className={folder === 'drafts' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('drafts')}><FileText size={18} /><span>Borradores</span></button>
       </nav>
+      {(session.labels?.length ?? 0) > 0 && <div className="sidebar-labels">
+        <div className="sidebar-section-title"><span>Etiquetas</span></div>
+        <nav aria-label="Etiquetas">
+          {session.labels?.map((label) => <button key={label.name} aria-label={`Etiqueta ${label.name}`} className={folder === 'all' && labelFilter === label.name ? 'folder-link label-link active' : 'folder-link label-link'} type="button" onClick={() => onLabel(label.name)}><span className="label-dot" style={{ background: labelColor(label.name) }} aria-hidden="true" /><span>{label.name}</span></button>)}
+        </nav>
+      </div>}
       <div className="sidebar-spacer" />
       <div className="retention-note"><span>Historial: {session.retentionDays} días</span><span>El archivo completo está en tu correo principal.</span></div>
       {session.usageAlerts?.enabled && <div className="usage-alert-test">

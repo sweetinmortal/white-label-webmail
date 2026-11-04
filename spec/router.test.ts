@@ -19,6 +19,7 @@ const mocks = vi.hoisted(() => ({
     receiveEmail: vi.fn(),
     sendMessage: vi.fn(),
     setRead: vi.fn(),
+    setSpam: vi.fn(),
   },
   dev: {
     seedLocal: vi.fn(),
@@ -104,6 +105,7 @@ beforeEach(() => {
   mocks.service.getRaw.mockReturnValue(new Response('raw message', { headers: { 'content-type': 'message/rfc822' } }));
   mocks.service.getOutgoingAttachment.mockReturnValue(new Response('attachment', { headers: { 'content-type': 'image/png' } }));
   mocks.service.sendMessage.mockResolvedValue({ id: 'm1', status: 'accepted', reused: false });
+  mocks.service.setSpam.mockResolvedValue(undefined);
   mocks.service.processWebhook.mockResolvedValue(undefined);
   mocks.service.receiveEmail.mockResolvedValue(undefined);
   mocks.service.cleanup.mockResolvedValue({ deleted: 0, held: 0 });
@@ -120,6 +122,59 @@ describe('API router ordering and boundary enforcement', () => {
     expect(mocks.service.listMessages).not.toHaveBeenCalled();
     expect(mocks.service.getCacheUsage).not.toHaveBeenCalled();
     expect(response.headers.get('cache-control')).toBe('no-store');
+  });
+
+  it('routes the filtered view without exposing it as a sent folder', async () => {
+    const response = await worker.fetch(jsonRequest('/api/filtered?unread=1'), env());
+    expect(response.status).toBe(200);
+    expect(mocks.service.listMessages).toHaveBeenCalledWith(expect.anything(), expect.anything(), identity, 'filtered', undefined, true, undefined, undefined);
+  });
+
+  it('routes the spam folder through the paginated mailbox list', async () => {
+    const response = await worker.fetch(jsonRequest('/api/spam?cursor=next-page&unread=1'), env());
+    expect(response.status).toBe(200);
+    expect(mocks.service.listMessages).toHaveBeenCalledWith(expect.anything(), expect.anything(), identity, 'spam', 'next-page', true, undefined, undefined);
+  });
+
+  it('accepts only boolean spam state in the authenticated message mutation route', async () => {
+    const marked = await worker.fetch(jsonRequest('/api/messages/m1/spam', 'PATCH', { spam: true }), env());
+    expect(marked.status).toBe(204);
+    expect(mocks.service.setSpam).toHaveBeenCalledWith(expect.anything(), expect.anything(), identity, 'm1', true);
+
+    const restored = await worker.fetch(jsonRequest('/api/messages/m1/spam', 'PATCH', { spam: false }), env());
+    expect(restored.status).toBe(204);
+    expect(mocks.service.setSpam).toHaveBeenLastCalledWith(expect.anything(), expect.anything(), identity, 'm1', false);
+
+    for (const body of [{}, { spam: 'yes' }, { spam: 1 }, null]) {
+      const invalid = await worker.fetch(jsonRequest('/api/messages/m1/spam', 'PATCH', body), env());
+      expect(invalid.status).toBe(400);
+      expect(await invalid.json()).toMatchObject({ error: { code: 'INVALID_SPAM_STATE' } });
+    }
+    expect(mocks.service.setSpam).toHaveBeenCalledTimes(2);
+  });
+
+  it('rejects spam mutations when origin validation or authentication fails', async () => {
+    mocks.auth.checkMutationOrigin.mockImplementation(() => {
+      throw new AppError(403, 'ORIGIN_REJECTED', 'bad origin');
+    });
+    const forbidden = await worker.fetch(jsonRequest('/api/messages/m1/spam', 'PATCH', { spam: true }), env());
+    expect(forbidden.status).toBe(403);
+    expect(mocks.service.setSpam).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    mocks.auth.authenticate.mockRejectedValue(new AppError(401, 'UNAUTHENTICATED', 'login required'));
+    const unauthenticated = await worker.fetch(jsonRequest('/api/messages/m1/spam', 'PATCH', { spam: true }), env());
+    expect(unauthenticated.status).toBe(401);
+    expect(mocks.auth.checkMutationOrigin).not.toHaveBeenCalled();
+    expect(mocks.service.setSpam).not.toHaveBeenCalled();
+  });
+
+  it('rejects unsupported methods on the spam message route', async () => {
+    const get = await worker.fetch(jsonRequest('/api/messages/m1/spam'), env());
+    const post = await worker.fetch(jsonRequest('/api/messages/m1/spam', 'POST', { spam: true }), env());
+    expect(get.status).toBe(405);
+    expect(post.status).toBe(405);
+    expect(mocks.service.setSpam).not.toHaveBeenCalled();
   });
 
   it('returns only the enabled threshold and seat limit needed by the alert button', async () => {

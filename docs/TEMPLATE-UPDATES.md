@@ -102,13 +102,13 @@ El workflow no vuelve a tocar un PR abierto de la misma versión. Si cierras el 
 
 ## Migraciones
 
-Las migraciones históricas usan `0001`–`0006`. Para migraciones nuevas usa un prefijo de fecha UTC:
+Las migraciones históricas `0001`–`0009` ya forman parte de instalaciones existentes; conserva sus nombres y contenidos para evitar que una actualización las presente como migraciones nuevas. Para migraciones nuevas usa un prefijo de fecha UTC:
 
 ```text
-migrations/202610231530_add_example.sql
+migrations/202611040900_message_spam.sql
 ```
 
-Así no chocan con migraciones locales como `0007`, `0008` o `0009`. El script rechaza prefijos numéricos duplicados y marca el PR como conflictivo.
+No renumeres ni renombres `0007_incoming_filters.sql`, `0008_drafts.sql` o `0009_scheduled_send_and_labels.sql`: pueden estar aplicadas en las instalaciones. Los prefijos de fecha evitan futuras colisiones con ese historial. El updater señala conflictos de archivos para revisión en el pull request.
 
 Las migraciones no se aplican automáticamente en producción. Después de mergear, revisa el SQL, haz respaldo y aplica las migraciones D1 antes de desplegar el código que las necesita.
 

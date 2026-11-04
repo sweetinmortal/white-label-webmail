@@ -31,6 +31,19 @@ export function formatListDate(value: string, locale = 'es-EC', now = new Date()
   }).format(parsed);
 }
 
+export function forwardSubject(value: string): string {
+  const subject = value.trim();
+  if (!subject) return 'Fwd: (sin asunto)';
+  return /^fwd?:/i.test(subject) ? subject : `Fwd: ${subject}`;
+}
+
+export function labelColor(name: string): string {
+  const palette = ['#1a73e8', '#188038', '#e37400', '#9334e6', '#d93025', '#12b5cb', '#a142f4', '#5f6368'];
+  let hash = 0;
+  for (const character of name) hash = (hash * 31 + character.charCodeAt(0)) >>> 0;
+  return palette[hash % palette.length];
+}
+
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${Math.round(bytes / 1024)} KB`;

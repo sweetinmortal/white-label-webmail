@@ -26,6 +26,12 @@ export interface Env {
   MAILJET_WEBHOOK_PASSWORD?: string;
   DEV_AUTH_EMAIL?: string;
 }
+export interface IncomingFilterRule {
+  id: string;
+  label: string;
+  from?: string[];
+  subjectContains?: string[];
+}
 export interface MailConfig {
   brand: Brand;
   appOrigin: string;
@@ -47,7 +53,14 @@ export interface MailConfig {
   storageProvider?: 'r2' | 'turso';
   usageAlerts?: { enabled: boolean; thresholdPercent: number; zeroTrustSeatLimit: number; delivery?: 'mailjet' | 'cloudflare' };
   archiveCopies?: { enabled: boolean; maxDecoratedBytes: number };
-  incomingSummary?: { enabled: boolean; batchSize: number; from?: Address; timeZone: string };
+  incomingFilters?: IncomingFilterRule[];
+  spamProtection?: { enabled: boolean; blockedSenders?: string[] };
+  incomingSummary?: {
+    enabled: boolean;
+    from?: Address;
+    timeZone: string;
+    schedule: { hour: number; minute: number; weekdaysOnly: boolean };
+  };
   accessTeamDomain: string;
   accessAudience: string;
   authProvider?: 'access' | 'google';

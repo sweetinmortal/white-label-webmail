@@ -16,7 +16,7 @@ export function archiveLabel(status: ArchiveStatus): string {
 
 export function sendLabel(status: SendStatus): string {
   const labels: Record<SendStatus, string> = {
-    pending: 'Pendiente', sending: 'En proceso', accepted: 'Aceptado por el proveedor',
+    scheduled: 'Programado', pending: 'Pendiente', sending: 'En proceso', accepted: 'Aceptado por el proveedor',
     failed: 'No se completó para todos los destinatarios', unknown: 'Pendiente de confirmación',
   };
   return labels[status];
