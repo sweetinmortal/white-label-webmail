@@ -14,9 +14,14 @@ import { handleGoogleAuth, cleanupGoogleAuth } from './google-auth';
 import { quarantineBlockedSenders } from './services/spam';
 import { handleOrganization, getOrganizationState } from './services/organization';
 import { handleGmail, syncGmail } from './services/gmail-sync';
+import { privacyPage } from './privacy';
 
 async function handle(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+  if (url.pathname === '/privacy') {
+    if (!['GET', 'HEAD'].includes(request.method)) throw new AppError(405, 'METHOD_NOT_ALLOWED', 'Método no permitido.');
+    return privacyPage(loadConfig(env), request.method === 'HEAD');
+  }
   if (!url.pathname.startsWith('/api/')) {
     if (!['GET', 'HEAD'].includes(request.method)) throw new AppError(405, 'METHOD_NOT_ALLOWED', 'Método no permitido.');
     return env.ASSETS.fetch(request);

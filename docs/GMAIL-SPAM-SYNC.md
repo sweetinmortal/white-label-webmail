@@ -64,3 +64,9 @@ Referencias oficiales:
 Para ver cómo esta integración encaja en el producto, consulta también el [README](../README.md).
 
 Las copias y decisiones guardadas en el webmail son independientes de Gmail. Desconectar elimina la conexión y los vínculos/observaciones Gmail; conserva los mensajes locales, sus etiquetas y sus decisiones.
+
+## Aviso público para la configuración de Google
+
+La instalación sirve un aviso factual en `/privacy`, con la marca, el contacto institucional y la retención configurados. No contiene el Gmail de archivo, la lista de usuarios, mensajes ni credenciales. Configura la página principal y ese URL en la información de marca de Google. El aviso describe el comportamiento de esta versión; revísalo si personalizas el tratamiento de datos.
+
+Si usas Cloudflare Access, permite acceso público únicamente a la ruta `/privacy` para que Google y los usuarios puedan leer el aviso. Las rutas del buzón y `/api/` deben conservar sus políticas de acceso. El Worker admite solo GET/HEAD en el aviso y mantiene la autenticación de las API del correo.
