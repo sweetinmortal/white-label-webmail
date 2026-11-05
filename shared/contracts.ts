@@ -1,3 +1,4 @@
+import type { OrganizationLabel } from './organization';
 export type Folder = 'inbox' | 'all' | 'sent' | 'filtered' | 'spam' | 'drafts';
 export type ArchiveStatus = 'pending' | 'forward_accepted' | 'smtp_accepted' | 'failed' | 'unknown';
 export type SendStatus = 'scheduled' | 'pending' | 'sending' | 'accepted' | 'failed' | 'unknown';
@@ -17,6 +18,8 @@ export interface MessageSummary {
   archiveStatus: ArchiveStatus;
   sendStatus?: SendStatus;
   filterLabel?: string;
+  labels?: OrganizationLabel[];
+  isArchived?: boolean;
   isSpam?: boolean;
   spamReason?: string;
 }
@@ -99,6 +102,7 @@ export interface SessionInfo {
   authProvider?: AuthProvider;
   identities?: Address[];
   labels?: LabelInfo[];
+  customLabels?: OrganizationLabel[];
   retentionDays: number;
   maxComposeBytes: number;
   maxAttachments: number;

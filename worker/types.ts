@@ -13,6 +13,9 @@ export interface Env {
   ACCESS_AUD?: string;
   GOOGLE_CLIENT_ID?: string;
   GOOGLE_CLIENT_SECRET?: string;
+  GMAIL_CLIENT_ID?: string;
+  GMAIL_CLIENT_SECRET?: string;
+  GMAIL_TOKEN_KEY?: string;
   TURSO_DATABASE_URL?: string;
   TURSO_AUTH_TOKEN?: string;
   CLOUDFLARE_ACCOUNT_ID?: string;
@@ -55,6 +58,7 @@ export interface MailConfig {
   archiveCopies?: { enabled: boolean; maxDecoratedBytes: number };
   incomingFilters?: IncomingFilterRule[];
   spamProtection?: { enabled: boolean; blockedSenders?: string[] };
+  gmailSync?: { enabled: boolean; intervalMinutes: number };
   incomingSummary?: {
     enabled: boolean;
     from?: Address;

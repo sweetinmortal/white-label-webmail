@@ -40,7 +40,7 @@ export async function quarantineBlockedSenders(db: D1Database, config: MailConfi
   let changed = 0;
   for (let offset = 0; offset < senders.length; offset += 50) {
     const chunk = senders.slice(offset, offset + 50);
-    const result = await db.prepare(`INSERT OR IGNORE INTO mail_message_spam (message_id, mailbox_id, is_spam, reason, source, updated_at) SELECT m.id, m.mailbox_id, 1, 'Remitente bloqueado por la empresa.', 'blocked_sender', ? FROM mail_messages m WHERE m.mailbox_id = ? AND m.direction = 'incoming' AND m.delete_state = 'active' AND LOWER(m.from_email) IN (${chunk.map(() => '?').join(',')})`)
+    const result = await db.prepare(`INSERT INTO mail_message_spam (message_id, mailbox_id, is_spam, reason, source, updated_at) SELECT m.id, m.mailbox_id, 1, 'Remitente bloqueado por la empresa.', 'blocked_sender', ? FROM mail_messages m WHERE m.mailbox_id = ? AND m.direction = 'incoming' AND m.delete_state = 'active' AND LOWER(m.from_email) IN (${chunk.map(() => '?').join(',')}) ON CONFLICT(message_id) DO UPDATE SET is_spam=1,reason=excluded.reason,source=excluded.source,updated_at=excluded.updated_at WHERE mail_message_spam.mailbox_id=excluded.mailbox_id AND mail_message_spam.source NOT IN ('manual','rule','blocked_sender')`)
       .bind(nowIso(), config.mailbox.id, ...chunk).run();
     changed += result.meta.changes ?? 0;
   }

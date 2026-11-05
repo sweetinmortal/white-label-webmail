@@ -49,7 +49,7 @@ const base = {
   preview_urls: false,
   assets: { binding: 'ASSETS', directory: './dist', not_found_handling: 'single-page-application', run_worker_first: ['/api/*'] },
   d1_databases: [{ binding: 'DB', database_name: 'company-mail', database_id: '00000000-0000-0000-0000-000000000000', migrations_dir: 'migrations' }],
-  triggers: { crons: ['15 * * * *', '* * * * *'] },
+  triggers: { crons: ['15 * * * *', '* * * * *', ...(company.gmailSync?.enabled ? ['*/5 * * * *'] : [])] },
   vars: { APP_ENV: 'production', COMPANY_CONFIG: companyJson },
 };
 if (storageProvider === 'r2') {
@@ -125,6 +125,10 @@ if (authProvider === 'google') {
   production.vars.ACCESS_AUD = deployment.accessAudience;
 }
 if (company.usageAlerts?.enabled) production.vars.CLOUDFLARE_ACCOUNT_ID = deployment.accountId;
+if (deployment.gmailClientId !== undefined) {
+  if (!/^\d+-[A-Za-z0-9_-]+\.apps\.googleusercontent\.com$/.test(deployment.gmailClientId)) throw new Error('gmailClientId no válido.');
+  production.vars.GMAIL_CLIENT_ID = deployment.gmailClientId;
+}
 if (company.usageAlerts?.enabled && usageAlertDelivery === 'cloudflare') {
   production.send_email = [{
     name: 'USAGE_ALERT_EMAIL',

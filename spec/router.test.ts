@@ -28,12 +28,17 @@ const mocks = vi.hoisted(() => ({
     checkUsageAlerts: vi.fn(),
     sendUsageAlertTest: vi.fn(),
   },
+  organization: {
+    getOrganizationState: vi.fn(async () => ({ labels: [], rules: [] })),
+    handleOrganization: vi.fn(async () => null),
+  },
 }));
 
 vi.mock('../worker/auth', () => mocks.auth);
 vi.mock('../worker/services/mail', () => mocks.service);
 vi.mock('../worker/dev', () => mocks.dev);
 vi.mock('../worker/services/usage-alerts', () => mocks.usageAlerts);
+vi.mock('../worker/services/organization', () => mocks.organization);
 
 import worker from '../worker/index';
 

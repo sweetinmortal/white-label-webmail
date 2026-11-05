@@ -166,6 +166,10 @@ export function loadConfig(env: Env): MailConfig {
     }
     spamProtection = { enabled: policy.enabled !== false, blockedSenders: [...new Set<string>((policy.blockedSenders ?? []).map(normalizeEmail))] };
   }
+  if (raw.gmailSync !== undefined && (!raw.gmailSync || Array.isArray(raw.gmailSync)
+    || typeof raw.gmailSync !== 'object' || typeof raw.gmailSync.enabled !== 'boolean')) {
+    throw new AppError(503, 'CONFIG_INVALID', 'La sincronización con Gmail no está configurada correctamente.');
+  }
   return {
     brand: { name: brandName, logo, primaryColor: color, locale: string(raw.brand?.locale, 'es', 30) },
     appOrigin,
@@ -189,6 +193,7 @@ export function loadConfig(env: Env): MailConfig {
     },
     ...(incomingFilters ? { incomingFilters } : {}),
     ...(spamProtection ? { spamProtection } : {}),
+    ...(raw.gmailSync ? { gmailSync: { enabled: raw.gmailSync.enabled, intervalMinutes: integer(raw.gmailSync.intervalMinutes, 5, 5, 60) } } : {}),
     ...(incomingSummary ? { incomingSummary } : {}),
     ...(raw.usageAlerts ? { usageAlerts: {
       enabled: !local && raw.usageAlerts.enabled,

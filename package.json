@@ -1,6 +1,6 @@
 {
   "name": "@white-label/webmail",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "license": "MIT",
   "type": "module",
@@ -19,6 +19,7 @@
     "configure": "node scripts/configure.mjs",
     "update:template": "node scripts/update-from-template.mjs",
     "archive:key": "node scripts/install-archive-key.mjs",
+    "gmail:key": "node scripts/install-gmail-key.mjs",
     "bundle:check": "npm run verify && wrangler deploy --dry-run --config wrangler.jsonc --outdir .wrangler/deploy-check",
     "deploy:check": "npm run verify && node scripts/doctor.mjs --strict && wrangler deploy --dry-run --config wrangler.production.jsonc --outdir .wrangler/deploy-check-production",
     "deploy": "npm run verify && node scripts/doctor.mjs --strict && wrangler deploy --config wrangler.production.jsonc"

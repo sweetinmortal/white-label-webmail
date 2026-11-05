@@ -1,5 +1,6 @@
 import type { D1Database } from '@cloudflare/workers-types';
 import { ensureSchema, nowIso } from './schema';
+import { ensureOrganizationSchema } from '../services/organization';
 
 export type SummaryItemStatus = 'pending' | 'claimed' | 'accepted' | 'failed' | 'unknown';
 export type SummaryBatchStatus = 'claiming' | 'sending' | 'accepted' | 'failed' | 'unknown';
@@ -63,6 +64,7 @@ export const SUMMARY_MAX_ATTEMPTS = 3;
 
 export async function enqueueSummaryItem(db: D1Database, input: SummaryItemInput): Promise<void> {
   await ensureSchema(db);
+  await ensureOrganizationSchema(db);
   await db.prepare(`INSERT OR IGNORE INTO mail_summary_items (message_id, mailbox_id, batch_id, status, sender_email, sender_name, subject, recipient_address, received_at, reply_from, reply_to_json, in_reply_to, references_json, created_at, claimed_at, error_code) VALUES (?, ?, NULL, 'pending', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)`)
     .bind(input.messageId, input.mailboxId, input.senderEmail, input.senderName, input.subject, input.recipientAddress, input.receivedAt, input.replyFrom, JSON.stringify(input.replyTo), input.inReplyTo ?? null, JSON.stringify(input.references), input.receivedAt)
     .run();
@@ -70,18 +72,20 @@ export async function enqueueSummaryItem(db: D1Database, input: SummaryItemInput
 
 export async function pendingSummaryCount(db: D1Database, mailboxId: string): Promise<number> {
   await ensureSchema(db);
-  const row = await db.prepare(`SELECT COUNT(*) AS count FROM mail_summary_items s WHERE s.mailbox_id = ? AND s.status = 'pending' AND s.attempts < ? AND NOT EXISTS (SELECT 1 FROM mail_message_filters f WHERE f.message_id = s.message_id) AND NOT EXISTS (SELECT 1 FROM mail_message_spam p WHERE p.message_id = s.message_id AND p.mailbox_id = s.mailbox_id AND p.is_spam = 1)`).bind(mailboxId, SUMMARY_MAX_ATTEMPTS).first<{ count: number }>();
+  await ensureOrganizationSchema(db);
+  const row = await db.prepare(`SELECT COUNT(*) AS count FROM mail_summary_items s WHERE s.mailbox_id = ? AND s.status = 'pending' AND s.attempts < ? AND NOT EXISTS (SELECT 1 FROM mail_message_filters f WHERE f.message_id = s.message_id AND NOT EXISTS(SELECT 1 FROM mail_message_organization o WHERE o.message_id=s.message_id AND o.mailbox_id=s.mailbox_id AND o.skip_inbox=0)) AND NOT EXISTS (SELECT 1 FROM mail_message_organization o WHERE o.message_id=s.message_id AND o.mailbox_id=s.mailbox_id AND o.skip_inbox=1) AND NOT EXISTS (SELECT 1 FROM mail_message_spam p WHERE p.message_id = s.message_id AND p.mailbox_id = s.mailbox_id AND p.is_spam = 1)`).bind(mailboxId, SUMMARY_MAX_ATTEMPTS).first<{ count: number }>();
   return Number(row?.count ?? 0);
 }
 
 export async function claimSummaryBatch(db: D1Database, mailboxId: string, batchSize: number): Promise<ClaimedSummaryBatch | null> {
   await ensureSchema(db);
+  await ensureOrganizationSchema(db);
   if ((await pendingSummaryCount(db, mailboxId)) < batchSize) return null;
   const batchId = crypto.randomUUID();
   const at = nowIso();
   await db.prepare(`INSERT INTO mail_summary_batches (id, mailbox_id, status, item_count, provider_message_id, error_code, created_at, updated_at) VALUES (?, ?, 'claiming', ?, NULL, NULL, ?, ?)`)
     .bind(batchId, mailboxId, batchSize, at, at).run();
-  await db.prepare(`UPDATE mail_summary_items SET status = 'claimed', batch_id = ?, claimed_at = ?, error_code = NULL, attempts = attempts + 1 WHERE message_id IN (SELECT s.message_id FROM mail_summary_items s WHERE s.mailbox_id = ? AND s.status = 'pending' AND s.attempts < ? AND NOT EXISTS (SELECT 1 FROM mail_message_filters f WHERE f.message_id = s.message_id) AND NOT EXISTS (SELECT 1 FROM mail_message_spam p WHERE p.message_id = s.message_id AND p.mailbox_id = s.mailbox_id AND p.is_spam = 1) ORDER BY s.created_at ASC, s.message_id ASC LIMIT ?)`)
+  await db.prepare(`UPDATE mail_summary_items SET status = 'claimed', batch_id = ?, claimed_at = ?, error_code = NULL, attempts = attempts + 1 WHERE message_id IN (SELECT s.message_id FROM mail_summary_items s WHERE s.mailbox_id = ? AND s.status = 'pending' AND s.attempts < ? AND NOT EXISTS (SELECT 1 FROM mail_message_filters f WHERE f.message_id = s.message_id AND NOT EXISTS(SELECT 1 FROM mail_message_organization o WHERE o.message_id=s.message_id AND o.mailbox_id=s.mailbox_id AND o.skip_inbox=0)) AND NOT EXISTS (SELECT 1 FROM mail_message_organization o WHERE o.message_id=s.message_id AND o.mailbox_id=s.mailbox_id AND o.skip_inbox=1) AND NOT EXISTS (SELECT 1 FROM mail_message_spam p WHERE p.message_id = s.message_id AND p.mailbox_id = s.mailbox_id AND p.is_spam = 1) ORDER BY s.created_at ASC, s.message_id ASC LIMIT ?)`)
     .bind(batchId, at, mailboxId, SUMMARY_MAX_ATTEMPTS, batchSize).run();
   const rows = await db.prepare(`SELECT message_id, mailbox_id, batch_id, status, sender_email, sender_name, subject, recipient_address, received_at, reply_from, reply_to_json, in_reply_to, references_json, created_at, claimed_at, error_code, attempts FROM mail_summary_items WHERE batch_id = ? ORDER BY created_at ASC, message_id ASC`)
     .bind(batchId).all<SummaryItemRow>();
@@ -119,6 +123,7 @@ async function releaseClaimedBatch(db: D1Database, batchId: string, reason: stri
 
 export async function finalizeSummaryBatch(db: D1Database, batchId: string, outcome: Exclude<SummaryBatchStatus, 'claiming' | 'sending'>, providerMessageId?: string, errorCode?: string): Promise<void> {
   await ensureSchema(db);
+  await ensureOrganizationSchema(db);
   const at = nowIso();
   // Claim and finalize are the only writers of a claimed item. The outer
   // status guards make the update a no-op if recovery already moved this
@@ -142,6 +147,7 @@ export async function finalizeSummaryBatch(db: D1Database, batchId: string, outc
 
 export async function recoverStaleSummaryBatches(db: D1Database, mailboxId: string): Promise<{ released: number; unknown: number }> {
   await ensureSchema(db);
+  await ensureOrganizationSchema(db);
   const cutoff = new Date(Date.now() - CLAIM_STALE_MS).toISOString();
   const rows = await db.prepare(`SELECT id, status FROM mail_summary_batches WHERE mailbox_id = ? AND status IN ('claiming', 'sending') AND updated_at <= ? ORDER BY updated_at ASC LIMIT ?`)
     .bind(mailboxId, cutoff, MAX_SWEEP).all<{ id: string; status: 'claiming' | 'sending' }>();
@@ -170,6 +176,7 @@ export async function recoverStaleSummaryBatches(db: D1Database, mailboxId: stri
 
 export async function cleanupSummaryState(db: D1Database, retentionDays: number): Promise<{ items: number; batches: number }> {
   await ensureSchema(db);
+  await ensureOrganizationSchema(db);
   const cutoff = new Date(Date.now() - Math.max(30, retentionDays + 30) * 86_400_000).toISOString();
   const itemResult = await db.prepare(`DELETE FROM mail_summary_items WHERE message_id IN (SELECT message_id FROM mail_summary_items WHERE status IN ('accepted', 'failed', 'unknown') AND created_at <= ? ORDER BY created_at ASC LIMIT 100)`).bind(cutoff).run();
   const batchResult = await db.prepare(`DELETE FROM mail_summary_batches WHERE id IN (SELECT id FROM mail_summary_batches WHERE status IN ('accepted', 'failed', 'unknown') AND updated_at <= ? ORDER BY updated_at ASC LIMIT 100)`).bind(cutoff).run();

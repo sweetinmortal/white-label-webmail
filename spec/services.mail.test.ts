@@ -289,6 +289,11 @@ class FakeD1 {
     return result();
   }
   async first<T = any>(sql: string, args: any[]): Promise<T | null> {
+    if (sql.includes('i.address AS identity_address') && sql.includes("m.direction = 'incoming'")) {
+      const row = this.messages.find(item => item.id === args[0] && item.mailbox_id === args[1]
+        && item.direction === 'incoming' && item.delete_state === 'active');
+      return (row ? { ...row, identity_address: null } : null) as T | null;
+    }
     if (sql.includes('SELECT id FROM mail_messages WHERE mailbox_id = ? AND incoming_key = ?')) {
       const row = this.messages.find((item) => item.mailbox_id === args[0] && item.incoming_key === args[1]);
       return (row ? { id: row.id } : null) as T;
@@ -379,8 +384,10 @@ class FakeD1 {
       const label = sql.includes('f.label = ?') ? args[2] : undefined;
       const unreadOnly = sql.includes('r.message_id IS NULL');
       const unreadIncludesOutgoing = sql.includes("m.direction = 'outgoing' OR r.message_id IS NULL");
-      const filteredOnly = sql.includes('f.message_id IS NOT NULL');
-      const unfilteredOnly = sql.includes('f.message_id IS NULL');
+      // This lightweight adapter has no custom archive rows. Its legacy
+      // archive state is the fallback of the production COALESCE expression.
+      const filteredOnly = whereSql.includes('COALESCE(o.skip_inbox, CASE WHEN f.message_id IS NULL THEN 0 ELSE 1 END)=1');
+      const unfilteredOnly = whereSql.includes('COALESCE(o.skip_inbox, CASE WHEN f.message_id IS NULL THEN 0 ELSE 1 END)=0');
       let rows = this.messages.filter((row) => row.mailbox_id === mailboxId && row.delete_state === 'active'
         && (!direction || row.direction === direction)
         && (!unreadOnly || (unreadIncludesOutgoing && row.direction === 'outgoing') || !this.reads.has(`${row.id}|${userEmail}`))

@@ -326,6 +326,11 @@ describe('spam folder and manual review with real D1 queries', () => {
 
     await setSpam(env, cfg, identity, 'historic-0', false);
     expect(await quarantineBlockedSenders(db, cfg)).toBe(0);
+    await db.prepare("UPDATE mail_message_spam SET is_spam=0,source='gmail' WHERE message_id='historic-1'").run();
+    await db.prepare("UPDATE mail_message_spam SET is_spam=0,source='rule' WHERE message_id='historic-2'").run();
+    expect(await quarantineBlockedSenders(db, cfg)).toBe(1);
+    expect(await db.prepare("SELECT is_spam,source FROM mail_message_spam WHERE message_id='historic-1'").first()).toMatchObject({ is_spam: 1, source: 'blocked_sender' });
+    expect(await db.prepare("SELECT is_spam,source FROM mail_message_spam WHERE message_id='historic-2'").first()).toMatchObject({ is_spam: 0, source: 'rule' });
     expect(await db.prepare('SELECT is_spam, source FROM mail_message_spam WHERE message_id = ?').bind('historic-0')
       .first<{ is_spam: number; source: string }>()).toMatchObject({ is_spam: 0, source: 'manual' });
   });

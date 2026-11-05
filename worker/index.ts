@@ -12,6 +12,8 @@ import { archiveReplyContext } from './services/archive-links';
 import { flushIncomingSummaries, incomingSummaryDue } from './services/incoming-summary';
 import { handleGoogleAuth, cleanupGoogleAuth } from './google-auth';
 import { quarantineBlockedSenders } from './services/spam';
+import { handleOrganization, getOrganizationState } from './services/organization';
+import { handleGmail, syncGmail } from './services/gmail-sync';
 
 async function handle(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
@@ -31,11 +33,16 @@ async function handle(request: Request, env: Env): Promise<Response> {
   }
   const identity: Identity = await authenticate(request, env, config);
   if (['POST', 'PATCH', 'DELETE', 'PUT'].includes(request.method)) checkMutationOrigin(request, config);
+  const gmailResponse = await handleGmail(request, env, config, identity);
+  if (gmailResponse) return gmailResponse;
+  const organizationResponse = await handleOrganization(request, env, config, identity);
+  if (organizationResponse) return organizationResponse;
   if (url.pathname === '/api/archive-reply' && request.method === 'GET') {
     return json(await archiveReplyContext(env, config, url.searchParams.get('token') || ''));
   }
   if (url.pathname === '/api/session' && request.method === 'GET') {
-    return json({ user: { email: identity.email }, authProvider: config.mode === 'local' ? 'local' : config.authProvider ?? 'access', brand: config.brand, mailbox: config.mailbox, archiveAddress: config.archiveAddress, identities: mailIdentities(config), labels: [...new Map((config.incomingFilters ?? []).map((rule) => [rule.label, { id: rule.id, name: rule.label }])).values()], retentionDays: config.retentionDays, maxComposeBytes: config.maxComposeBytes, maxAttachments: config.maxAttachments, maxAttachmentBytes: config.maxAttachmentBytes, mode: config.mode, cache: await getCacheUsage(env, config), ...(config.usageAlerts ? { usageAlerts: { enabled: config.usageAlerts.enabled, thresholdPercent: config.usageAlerts.thresholdPercent, limit: config.usageAlerts.zeroTrustSeatLimit } } : {}) });
+    const organization = await getOrganizationState(env.DB, config);
+    return json({ user: { email: identity.email }, authProvider: config.mode === 'local' ? 'local' : config.authProvider ?? 'access', brand: config.brand, mailbox: config.mailbox, archiveAddress: config.archiveAddress, identities: mailIdentities(config), customLabels: organization.labels, labels: [...new Map((config.incomingFilters ?? []).map((rule) => [rule.label, { id: rule.id, name: rule.label }])).values()], retentionDays: config.retentionDays, maxComposeBytes: config.maxComposeBytes, maxAttachments: config.maxAttachments, maxAttachmentBytes: config.maxAttachmentBytes, mode: config.mode, cache: await getCacheUsage(env, config), ...(config.usageAlerts ? { usageAlerts: { enabled: config.usageAlerts.enabled, thresholdPercent: config.usageAlerts.thresholdPercent, limit: config.usageAlerts.zeroTrustSeatLimit } } : {}) });
   }
   if (url.pathname === '/api/usage-alerts/test' && request.method === 'POST') {
     return json(await sendUsageAlertTest(env, config));
@@ -116,6 +123,11 @@ export default {
   async scheduled(controller: ScheduledController, env: Env): Promise<void> {
     const config = loadConfig(env);
     const at = Number.isFinite(controller.scheduledTime) ? new Date(controller.scheduledTime) : new Date();
+    if (controller.cron === '*/5 * * * *') {
+      try { await syncGmail(env, config); }
+      catch { console.warn('webmail_gmail_sync_failed'); }
+      return;
+    }
     // The every-minute trigger handles scheduled sends and checks whether a
     // configured incoming summary is due. Keep maintenance, auth cleanup and
     // quota checks off that hot path.

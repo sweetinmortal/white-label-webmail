@@ -19,6 +19,8 @@ import { cleanupSummaryState, enqueueSummaryItem } from '../store/incoming-summa
 import { matchIncomingFilter } from './incoming-filters';
 import { renderReplyHtml } from './reply-html';
 import { classifyIncomingSpam } from './spam';
+import { ensureOrganizationSchema, attachMessageLabels, applyIncomingRules } from './organization';
+import { applyCachedGmailVerdict } from './gmail-sync';
 
 const MAX_CURSOR_BYTES = 512;
 const MAX_PAGE = 30;
@@ -65,6 +67,7 @@ interface MessageRow {
   filter_rule_id?: string | null;
   is_spam?: number | null;
   spam_reason?: string | null;
+  is_archived?: number | null;
   idempotency_key?: string | null;
   payload_hash?: string | null;
   outbox_status?: SendStatus | null;
@@ -266,6 +269,7 @@ function rowToSummary(row: MessageRow, config: MailConfig, isRead = row.is_read 
     ...(row.send_status ? { sendStatus: row.send_status } : {}),
     ...(row.filter_label ? { filterLabel: row.filter_label } : {}),
     isSpam: row.direction === 'incoming' && row.is_spam === 1,
+    isArchived: row.direction === 'incoming' && (row.is_archived == null ? !!row.filter_label : row.is_archived === 1),
     ...(row.is_spam === 1 && row.spam_reason ? { spamReason: row.spam_reason } : {}),
   };
 }
@@ -355,7 +359,8 @@ async function sha256(value: string): Promise<string> {
 async function getRow(db: D1Database, identity: Identity, config: MailConfig, messageId: string): Promise<MessageRow> {
   assertMailbox(identity, config);
   await ensureSchema(db);
-  const row = await db.prepare(`SELECT m.*, s.is_spam AS is_spam, s.reason AS spam_reason, f.label AS filter_label, f.rule_id AS filter_rule_id, CASE WHEN m.direction = 'outgoing' THEN 1 ELSE CASE WHEN r.message_id IS NULL THEN 0 ELSE 1 END END AS is_read, a.address AS identity_address FROM mail_messages m LEFT JOIN mail_read_states r ON r.message_id = m.id AND r.user_email = ? LEFT JOIN mail_message_identities a ON a.message_id = m.id LEFT JOIN mail_message_filters f ON f.message_id = m.id LEFT JOIN mail_message_spam s ON s.message_id = m.id AND s.mailbox_id = m.mailbox_id WHERE m.id = ? AND m.mailbox_id = ? AND m.delete_state <> 'deleted'`)
+  await ensureOrganizationSchema(db);
+  const row = await db.prepare(`SELECT m.*, o.skip_inbox AS is_archived, s.is_spam AS is_spam, s.reason AS spam_reason, f.label AS filter_label, f.rule_id AS filter_rule_id, CASE WHEN m.direction = 'outgoing' THEN 1 ELSE CASE WHEN r.message_id IS NULL THEN 0 ELSE 1 END END AS is_read, a.address AS identity_address FROM mail_messages m LEFT JOIN mail_read_states r ON r.message_id = m.id AND r.user_email = ? LEFT JOIN mail_message_identities a ON a.message_id = m.id LEFT JOIN mail_message_filters f ON f.message_id = m.id LEFT JOIN mail_message_spam s ON s.message_id = m.id AND s.mailbox_id = m.mailbox_id LEFT JOIN mail_message_organization o ON o.message_id = m.id AND o.mailbox_id = m.mailbox_id WHERE m.id = ? AND m.mailbox_id = ? AND m.delete_state <> 'deleted'`)
     .bind(normalizeEmail(identity.email), messageId, config.mailbox.id).first<MessageRow>();
   if (!row) throw new AppError(404, 'message_not_found', 'El mensaje no existe en este buzón.');
   return row;
@@ -475,17 +480,18 @@ export async function listMessages(env: Env, config: MailConfig, identity: Ident
   if (label !== undefined && (folder !== 'all' || !label.trim() || label.length > 160)) throw new AppError(400, 'label_invalid', 'La etiqueta solicitada no es válida.');
   await ensureSchema(env.DB);
   const decoded = decodeCursor(cursor);
+  await ensureOrganizationSchema(env.DB);
   const limit = MAX_PAGE;
   const conditions = ['m.mailbox_id = ?', "m.delete_state = 'active'"];
   const values: unknown[] = [config.mailbox.id];
   if (folder === 'sent') conditions.push("m.direction = 'outgoing'");
   else if (folder !== 'all') conditions.push("m.direction = 'incoming'");
-  if (folder === 'inbox') conditions.push('f.message_id IS NULL');
-  if (folder === 'filtered') conditions.push('f.message_id IS NOT NULL');
+  if (folder === 'inbox') conditions.push('COALESCE(o.skip_inbox, CASE WHEN f.message_id IS NULL THEN 0 ELSE 1 END)=0');
+  if (folder === 'filtered') conditions.push('COALESCE(o.skip_inbox, CASE WHEN f.message_id IS NULL THEN 0 ELSE 1 END)=1');
   conditions.push(folder === 'spam' ? 's.is_spam = 1' : 'COALESCE(s.is_spam, 0) = 0');
   if (label !== undefined) {
-    conditions.push("m.direction = 'incoming'", 'f.label = ?');
-    values.push(label.trim());
+    conditions.push('(f.label = ? OR EXISTS(SELECT 1 FROM mail_message_labels ml JOIN mail_labels l ON l.id=ml.label_id AND l.mailbox_id=ml.mailbox_id WHERE ml.message_id=m.id AND ml.mailbox_id=m.mailbox_id AND l.name = ? COLLATE NOCASE))');
+    values.push(label.trim(), label.trim());
   }
   if (address !== undefined) {
     const selected = resolveSender(config, address);
@@ -497,19 +503,20 @@ export async function listMessages(env: Env, config: MailConfig, identity: Ident
     conditions.push('(m.created_at < ? OR (m.created_at = ? AND m.id < ?))');
     values.push(decoded.createdAt, decoded.createdAt, decoded.id);
   }
-  const query = `SELECT m.*, s.is_spam AS is_spam, s.reason AS spam_reason, f.label AS filter_label, f.rule_id AS filter_rule_id, CASE WHEN m.direction = 'outgoing' THEN 1 ELSE CASE WHEN r.message_id IS NULL THEN 0 ELSE 1 END END AS is_read, a.address AS identity_address FROM mail_messages m LEFT JOIN mail_read_states r ON r.message_id = m.id AND r.user_email = ? LEFT JOIN mail_message_identities a ON a.message_id = m.id LEFT JOIN mail_message_filters f ON f.message_id = m.id LEFT JOIN mail_message_spam s ON s.message_id = m.id AND s.mailbox_id = m.mailbox_id WHERE ${conditions.join(' AND ')} ORDER BY m.created_at DESC, m.id DESC LIMIT ?`;
+  const query = `SELECT m.*, o.skip_inbox AS is_archived, s.is_spam AS is_spam, s.reason AS spam_reason, f.label AS filter_label, f.rule_id AS filter_rule_id, CASE WHEN m.direction = 'outgoing' THEN 1 ELSE CASE WHEN r.message_id IS NULL THEN 0 ELSE 1 END END AS is_read, a.address AS identity_address FROM mail_messages m LEFT JOIN mail_read_states r ON r.message_id = m.id AND r.user_email = ? LEFT JOIN mail_message_identities a ON a.message_id = m.id LEFT JOIN mail_message_filters f ON f.message_id = m.id LEFT JOIN mail_message_spam s ON s.message_id = m.id AND s.mailbox_id = m.mailbox_id LEFT JOIN mail_message_organization o ON o.message_id = m.id AND o.mailbox_id = m.mailbox_id WHERE ${conditions.join(' AND ')} ORDER BY m.created_at DESC, m.id DESC LIMIT ?`;
   const result = await env.DB.prepare(query).bind(normalizeEmail(identity.email), ...values, limit + 1).all<MessageRow>();
   const rows = result.results ?? [];
   const pageRows = rows.slice(0, limit);
   const last = pageRows.at(-1);
-  return { items: pageRows.map((row) => rowToSummary(row, config)), nextCursor: rows.length > limit && last ? encodeCursor({ createdAt: last.created_at, id: last.id }) : null };
+  return { items: await attachMessageLabels(env.DB, config, pageRows.map((row) => rowToSummary(row, config))), nextCursor: rows.length > limit && last ? encodeCursor({ createdAt: last.created_at, id: last.id }) : null };
 }
 
 export async function getMessage(env: Env, config: MailConfig, identity: Identity, messageId: string): Promise<MessageDetail> {
   const row = await getRow(env.DB, identity, config, messageId);
   const snapshot = await outgoingSnapshot(env, config, row);
+  const [summary] = await attachMessageLabels(env.DB, config, [rowToSummary(row, config)]);
   return {
-    ...rowToSummary(row, config),
+    ...summary,
     ...(row.reply_to_json ? { replyTo: rowAddress(row.reply_to_json) } : {}),
     ...(snapshot?.attachments.length ? { attachments: snapshot.attachments } : {}),
     ...(row.rfc_message_id ? { rfcMessageId: row.rfc_message_id } : {}),
@@ -1150,7 +1157,13 @@ export async function receiveEmail(env: Env, config: MailConfig, message: Incomi
     // retained copy when indexing fails.
     return;
   }
-  if (!incomingFilter && !spam.isSpam && config.incomingSummary?.enabled) {
+  let organization = { skipInbox: false, isSpam: spam.isSpam };
+  try { organization = await applyIncomingRules(env.DB, config, messageId); }
+  catch { console.warn('webmail_incoming_rules_failed'); }
+  try { await applyCachedGmailVerdict(env, config, messageId); }
+  catch { console.warn('webmail_incoming_gmail_reconciliation_failed'); }
+  const finalSpam = await env.DB.prepare('SELECT is_spam FROM mail_message_spam WHERE message_id=? AND mailbox_id=?').bind(messageId, config.mailbox.id).first<{ is_spam: number }>().catch(() => null);
+  if (!incomingFilter && !organization.skipInbox && !(finalSpam ? finalSpam.is_spam === 1 : organization.isSpam) && config.incomingSummary?.enabled) {
     try {
       const replyAddress = parseAddress(parseHeader(headers, 'reply-to') || headerFrom || from.email);
       const replyTo = EMAIL_RE.test(replyAddress.email) && replyAddress.email.length <= 254 ? [normalizeEmail(replyAddress.email)] : [];

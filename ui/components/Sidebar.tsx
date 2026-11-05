@@ -1,22 +1,30 @@
-import { Archive, Bell, FileText, Filter, LoaderCircle, LogOut, Mail, Plus, Send, ShieldAlert } from 'lucide-react';
-import { useState } from 'react';
+import { Archive, Bell, FileText, Filter, LoaderCircle, LogOut, Mail, Plus, Send, Settings, ShieldAlert } from 'lucide-react';
+import { useMemo, useState } from 'react';
 import type { Folder, SessionInfo } from '../../shared/contracts';
+import type { OrganizationLabel } from '../../shared/organization';
 import { apiFetch } from '../lib/api';
 import { initials, labelColor } from '../lib/format';
 
-export default function Sidebar({ session, folder, labelFilter, onFolder, onLabel, onCompose, onTestUsageAlert, usageAlertTestBusy, usageAlertTestPending }: {
+export default function Sidebar({ session, folder, labelFilter, onFolder, onLabel, onCompose, onSettings, onTestUsageAlert, usageAlertTestBusy, usageAlertTestPending }: {
   session: SessionInfo;
   folder: Folder;
   labelFilter: string | null;
   onFolder: (folder: Folder) => void;
   onLabel: (label: string) => void;
   onCompose: () => void;
+  onSettings: () => void;
   onTestUsageAlert: () => void;
   usageAlertTestBusy: boolean;
   usageAlertTestPending: boolean;
 }) {
   const [logoutBusy, setLogoutBusy] = useState(false);
   const [logoutError, setLogoutError] = useState(false);
+  const labels = useMemo(() => {
+    const byName = new Map<string, { id: string; name: string; color?: string }>();
+    for (const label of session.labels ?? []) byName.set(label.name, label);
+    for (const label of (session.customLabels ?? []) as OrganizationLabel[]) byName.set(label.name, label);
+    return [...byName.values()];
+  }, [session.labels, session.customLabels]);
   const logout = async () => {
     if (logoutBusy) return;
     setLogoutBusy(true);
@@ -40,15 +48,15 @@ export default function Sidebar({ session, folder, labelFilter, onFolder, onLabe
       <nav className="folder-nav" aria-label="Carpetas">
         <button aria-label="Recibidos" className={folder === 'inbox' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('inbox')}><Mail size={18} /><span>Recibidos</span></button>
         <button aria-label="Todos" className={folder === 'all' && !labelFilter ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('all')}><Archive size={18} /><span>Todos</span></button>
-        <button aria-label="Filtrados" className={folder === 'filtered' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('filtered')}><Filter size={18} /><span>Filtrados</span></button>
+        <button aria-label="Archivados" className={folder === 'filtered' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('filtered')}><Filter size={18} /><span>Archivados</span></button>
         <button aria-label="Spam" className={folder === 'spam' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('spam')}><ShieldAlert size={18} /><span>Spam</span></button>
         <button aria-label="Enviados" className={folder === 'sent' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('sent')}><Send size={18} /><span>Enviados</span></button>
         <button aria-label="Borradores" className={folder === 'drafts' ? 'folder-link active' : 'folder-link'} type="button" onClick={() => onFolder('drafts')}><FileText size={18} /><span>Borradores</span></button>
       </nav>
-      {(session.labels?.length ?? 0) > 0 && <div className="sidebar-labels">
+      {labels.length > 0 && <div className="sidebar-labels">
         <div className="sidebar-section-title"><span>Etiquetas</span></div>
         <nav aria-label="Etiquetas">
-          {session.labels?.map((label) => <button key={label.name} aria-label={`Etiqueta ${label.name}`} className={folder === 'all' && labelFilter === label.name ? 'folder-link label-link active' : 'folder-link label-link'} type="button" onClick={() => onLabel(label.name)}><span className="label-dot" style={{ background: labelColor(label.name) }} aria-hidden="true" /><span>{label.name}</span></button>)}
+          {labels.map((label) => <button key={label.name} aria-label={`Etiqueta ${label.name}`} className={folder === 'all' && labelFilter === label.name ? 'folder-link label-link active' : 'folder-link label-link'} type="button" onClick={() => onLabel(label.name)}><span className="label-dot" style={{ background: label.color && /^#[\da-f]{6}$/i.test(label.color) ? label.color : labelColor(label.name) }} aria-hidden="true" /><span>{label.name}</span></button>)}
         </nav>
       </div>}
       <div className="sidebar-spacer" />
@@ -60,6 +68,11 @@ export default function Sidebar({ session, folder, labelFilter, onFolder, onLabe
         </button>
         <span>Umbral: {session.usageAlerts.thresholdPercent}% de {session.usageAlerts.limit} usuarios</span>
       </div>}
+      <div className="settings-control">
+        <button className="button button-secondary settings-button" type="button" onClick={onSettings} aria-label="Ajustes" title="Ajustes">
+          <Settings size={17} aria-hidden="true" /><span>Ajustes</span>
+        </button>
+      </div>
       {session.authProvider === 'google' && <div className="logout-control">
         <button className="button button-secondary logout-button" type="button" onClick={() => void logout()} disabled={logoutBusy} aria-label={logoutBusy ? 'Cerrando sesión' : 'Cerrar sesión'}>
           {logoutBusy ? <LoaderCircle className="spin" size={17} aria-hidden="true" /> : <LogOut size={17} aria-hidden="true" />}

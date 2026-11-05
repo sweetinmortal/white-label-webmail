@@ -40,6 +40,10 @@
     "enabled": true,
     "blockedSenders": []
   },
+  "gmailSync": {
+    "enabled": false,
+    "intervalMinutes": 5
+  },
   "usageAlerts": {
     "enabled": false,
     "thresholdPercent": 95,

@@ -1,3 +1,8 @@
 # Local development uses a simulated provider and the local R2 mock.
 # Replace this example identity with an address in config/companies/example.json.
 DEV_AUTH_EMAIL="owner@example.net"
+
+# Optional Gmail sync production secrets: GMAIL_TOKEN_KEY (32 random bytes,
+# base64url), GMAIL_CLIENT_SECRET. Set via wrangler secret put, never in Git.
+# GMAIL_CLIENT_ID can be deployment.gmailClientId. Existing Google login
+# credentials are supported as a fallback. See docs/GMAIL-SPAM-SYNC.md.

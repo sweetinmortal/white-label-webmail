@@ -6,6 +6,7 @@ import DraftListPanel from './components/DraftListPanel';
 import LoginScreen from './components/LoginScreen';
 import MessageListPanel from './components/MessageListPanel';
 import ReaderPanel from './components/ReaderPanel';
+import SettingsDialog, { type GmailFeedback } from './components/SettingsDialog';
 import Sidebar from './components/Sidebar';
 import StartupScreen from './components/StartupScreen';
 import { apiFetch, ApiRequestError, getSession, MAX_DOWNLOAD_BYTES, MAX_PREVIEW_BYTES, parseRawInWorker, requestOutgoingAttachment, requestRaw, type Attachment } from './lib/api';
@@ -128,7 +129,9 @@ export default function App() {
   return <MailApp session={startup.session} />;
 }
 
-function MailApp({ session }: { session: SessionInfo }) {
+function MailApp({ session: initialSession }: { session: SessionInfo }) {
+  const [session, setSession] = useState(initialSession);
+  const [settings, setSettings] = useState<{ tab: 'labels' | 'rules' | 'gmail'; gmailFeedback?: GmailFeedback } | null>(null);
   const [folder, setFolder] = useState<Folder>('inbox');
   const [labelFilter, setLabelFilter] = useState<string | null>(null);
   const [unreadOnly, setUnreadOnly] = useState(false);
@@ -153,6 +156,7 @@ function MailApp({ session }: { session: SessionInfo }) {
   const [readerRetryKey, setReaderRetryKey] = useState(0);
   const [spamSavingId, setSpamSavingId] = useState<string | null>(null);
   const [spamActionError, setSpamActionError] = useState<{ id: string; message: string } | null>(null);
+  const [archiveSavingId, setArchiveSavingId] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [compose, setCompose] = useState<ComposeState | null>(null);
   const [seedLoading, setSeedLoading] = useState(false);
@@ -168,6 +172,18 @@ function MailApp({ session }: { session: SessionInfo }) {
   selectedContextRef.current = { id: selectedId, folder };
   const archiveReplyStartedRef = useRef<string | null>(null);
   const archiveReplyMountedRef = useRef(false);
+
+  useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get('settings') !== 'gmail') return;
+    const value = url.searchParams.get('gmail');
+    const allowed: GmailFeedback[] = ['connected', 'failed', 'denied', 'wrong_account'];
+    const gmailFeedback = allowed.includes(value as GmailFeedback) ? value as GmailFeedback : undefined;
+    setSettings({ tab: 'gmail', ...(gmailFeedback ? { gmailFeedback } : {}) });
+    url.searchParams.delete('settings');
+    if (gmailFeedback) url.searchParams.delete('gmail');
+    window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+  }, []);
 
   useEffect(() => {
     archiveReplyMountedRef.current = true;
@@ -249,6 +265,47 @@ function MailApp({ session }: { session: SessionInfo }) {
         spamActionRequestRef.current = null;
         setSpamSavingId(null);
       }
+    }
+  }, []);
+
+  const updateMessageLabels = useCallback(async (id: string, labelIds: string[]) => {
+    await apiFetch<void>(`/messages/${encodeURIComponent(id)}/labels`, { method: 'PATCH', body: JSON.stringify({ labelIds }) });
+    const labels = (session.customLabels ?? []).filter((label) => labelIds.includes(label.id));
+    setItems((current) => current.map((item) => item.id === id ? { ...item, labels } : item));
+    setDetail((current) => current?.id === id ? { ...current, labels } : current);
+    setNotice('Etiquetas guardadas en la copia local.');
+  }, [session.customLabels]);
+
+  const updateMessageArchive = useCallback(async (id: string, archived: boolean) => {
+    if (archiveSavingId) return;
+    setArchiveSavingId(id);
+    try {
+      await apiFetch<void>(`/messages/${encodeURIComponent(id)}/archive`, { method: 'PATCH', body: JSON.stringify({ archived }) });
+      const currentFolder = selectedContextRef.current.folder;
+      const shouldLeaveFolder = (archived && currentFolder === 'inbox') || (!archived && currentFolder === 'filtered');
+      setItems((current) => shouldLeaveFolder
+        ? current.filter((item) => item.id !== id)
+        : current.map((item) => item.id === id ? { ...item, isArchived: archived } : item));
+      setDetail((current) => current?.id === id ? { ...current, isArchived: archived } : current);
+      if (shouldLeaveFolder && selectedContextRef.current.id === id) {
+        setSelectedId(null);
+        setView('list');
+      }
+      setNotice(archived ? 'Mensaje archivado en la copia local.' : 'Mensaje devuelto a Recibidos en la copia local.');
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudo actualizar el archivado del mensaje.');
+    } finally {
+      setArchiveSavingId(null);
+    }
+  }, [archiveSavingId]);
+
+  const refreshSession = useCallback(async () => {
+    try {
+      setSession(await getSession());
+      setReloadKey((current) => current + 1);
+      setReaderRetryKey((current) => current + 1);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : 'No se pudieron actualizar los ajustes de sesión.');
     }
   }, []);
 
@@ -481,16 +538,17 @@ function MailApp({ session }: { session: SessionInfo }) {
   }, []);
 
   return <div className="app-shell" style={{ '--blue': session.brand.primaryColor } as CSSProperties}>
-    <Sidebar session={session} folder={folder} labelFilter={labelFilter} onFolder={openFolder} onLabel={openLabel} onCompose={openCompose} onTestUsageAlert={testUsageAlert} usageAlertTestBusy={usageAlertTestBusy} usageAlertTestPending={usageAlertTestPending} />
+    <Sidebar session={session} folder={folder} labelFilter={labelFilter} onFolder={openFolder} onLabel={openLabel} onCompose={openCompose} onSettings={() => setSettings({ tab: 'labels' })} onTestUsageAlert={testUsageAlert} usageAlertTestBusy={usageAlertTestBusy} usageAlertTestPending={usageAlertTestPending} />
     <main className="mail-main">
       <div className={showingReader ? 'mail-list-layer is-covered' : 'mail-list-layer'} aria-hidden={showingReader || undefined} inert={showingReader}>
         {folder === 'drafts'
           ? <DraftListPanel drafts={drafts} loading={listLoading} error={listError} openingId={openingDraftId} deletingId={deletingDraftId} onRefresh={refresh} onOpen={(draft) => void openDraft(draft)} onDiscard={(draft) => void discardDraft(draft)} locale={session.brand.locale} />
-          : <MessageListPanel session={session} folder={folder} labelFilter={labelFilter} unreadOnly={unreadOnly} identityFilter={identityFilter} items={items} selectedId={selectedId} loading={listLoading} error={listError} nextCursor={nextCursor} onUnreadOnly={setUnreadOnly} onIdentityFilter={setIdentityFilter} onRefresh={refresh} onSelect={selectMessage} onLoadMore={() => void loadFolder(false)} onSeed={session.mode === 'local' && folder === 'inbox' ? seedLocal : undefined} seedLoading={seedLoading} locale={session.brand.locale} />}
+          : <MessageListPanel session={session} folder={folder} labelFilter={labelFilter} unreadOnly={unreadOnly} identityFilter={identityFilter} items={items} selectedId={selectedId} loading={listLoading} error={listError} nextCursor={nextCursor} onUnreadOnly={setUnreadOnly} onIdentityFilter={setIdentityFilter} onRefresh={refresh} onSelect={selectMessage} onLoadMore={() => void loadFolder(false)} onSeed={session.mode === 'local' && folder === 'inbox' ? seedLocal : undefined} seedLoading={seedLoading} locale={session.brand.locale} customLabels={session.customLabels ?? []} onSaveLabels={updateMessageLabels} onSetArchived={(id, archived) => void updateMessageArchive(id, archived)} archiveSavingId={archiveSavingId} />}
       </div>
-      {showingReader && <ReaderPanel session={session} detail={detail} isSpam={folder === 'spam' || Boolean(detail?.isSpam)} bodyText={bodyText} html={bodyHtml} styles={bodyStyles} remoteImages={remoteImages} attachments={attachments} loading={readerLoading} error={readerError} spamBusy={spamSavingId !== null} spamError={spamActionError && spamActionError.id === detail?.id ? spamActionError.message : null} onBack={closeReader} onMarkRead={(read) => { if (selectedId) void markRead(selectedId, read); }} onSetSpam={(spam) => { if (detail?.id) void updateSpam(detail.id, spam); }} onDownload={downloadOriginal} onDownloadAttachment={(attachment) => void downloadAttachment(attachment)} onReply={openReply} onForward={openForward} onRetry={() => setReaderRetryKey((key) => key + 1)} />}
+      {showingReader && <ReaderPanel session={session} detail={detail} isSpam={folder === 'spam' || Boolean(detail?.isSpam)} customLabels={session.customLabels ?? []} archiveBusy={archiveSavingId !== null} onSaveLabels={(ids) => detail ? updateMessageLabels(detail.id, ids) : Promise.resolve()} onSetArchived={(archived) => { if (detail?.id) void updateMessageArchive(detail.id, archived); }} bodyText={bodyText} html={bodyHtml} styles={bodyStyles} remoteImages={remoteImages} attachments={attachments} loading={readerLoading} error={readerError} spamBusy={spamSavingId !== null} spamError={spamActionError && spamActionError.id === detail?.id ? spamActionError.message : null} onBack={closeReader} onMarkRead={(read) => { if (selectedId) void markRead(selectedId, read); }} onSetSpam={(spam) => { if (detail?.id) void updateSpam(detail.id, spam); }} onDownload={downloadOriginal} onDownloadAttachment={(attachment) => void downloadAttachment(attachment)} onReply={openReply} onForward={openForward} onRetry={() => setReaderRetryKey((key) => key + 1)} />}
     </main>
     {notice && !compose && <div className="toast" role="status">{notice}<button type="button" aria-label="Cerrar aviso" onClick={() => setNotice(null)}><X size={16} /></button></div>}
+    {settings && <SettingsDialog initialTab={settings.tab} gmailFeedback={settings.gmailFeedback} onClose={() => setSettings(null)} onChanged={refreshSession} />}
     {compose && <ComposeDialog key={`${compose.draft ? 'd' : compose.forwardOf ? 'f' : compose.replyTo ? 'r' : compose.archiveReply ? 'a' : 'n'}-${compose.draft?.id ?? compose.forwardOf?.id ?? compose.replyTo?.id ?? compose.archiveReply?.token ?? 'new'}`} session={session} replyTo={compose.replyTo} forwardOf={compose.forwardOf} archiveReply={compose.archiveReply} draft={compose.draft} onClose={closeCompose} onSent={onSent} onScheduled={onScheduled} />}
   </div>;
 }

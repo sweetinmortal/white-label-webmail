@@ -4,6 +4,8 @@ Aplicación de correo compartida para una empresa sobre Cloudflare Workers. Cada
 
 Incluye Recibidos, Filtrados, Spam, Todos y Enviados; lectura HTML aislada; filtros; borradores privados; respuestas con citas; adjuntos; y envíos programados. Los usuarios pueden corregir la clasificación desde el lector. No implementa servidores IMAP ni SMTP.
 
+Desde Ajustes puedes gestionar [etiquetas y reglas](docs/ORGANIZATION.md): varias etiquetas por mensaje, colores, archivo manual y reglas por remitente, destinatario y asunto. La [sincronización opcional de Spam con Gmail](docs/GMAIL-SPAM-SYNC.md) consulta únicamente cabeceras y etiquetas, con una conexión independiente por empresa. Está desactivada de fábrica y requiere autorización adicional de Google.
+
 En escritorio usa una barra lateral compacta y dos paneles: al abrir un mensaje, el lector sustituye la lista y se vuelve con una flecha. En las listas, los mensajes del día actual muestran solo la hora; los anteriores conservan la fecha corta.
 
 ## Componentes
